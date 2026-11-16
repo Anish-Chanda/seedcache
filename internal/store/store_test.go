@@ -41,7 +41,7 @@ func TestOpenInitializesMigrationsAndNoOpLogs(t *testing.T) {
 		t.Fatalf("reopen() error = %v", err)
 	}
 	defer db.Close()
-	if err := assertAppliedMigration(db, 1); err != nil {
+	if err := assertAppliedMigration(db, 2); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(logs.String(), "SQLite database schema is up to date") {
@@ -88,7 +88,7 @@ func TestOpenPreservesExistingDataAndUserVersion(t *testing.T) {
 	if userVersion != 1 {
 		t.Errorf("user_version = %d, want preserved value 1", userVersion)
 	}
-	if err := assertAppliedMigration(db, 1); err != nil {
+	if err := assertAppliedMigration(db, 2); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -160,7 +160,7 @@ func TestOpenRejectsNewerAndDirtyMigrationVersions(t *testing.T) {
 		dirty   bool
 		want    string
 	}{
-		{name: "newer", version: 2, want: "no migration found for version 2"},
+		{name: "newer", version: 3, want: "no migration found for version 3"},
 		{name: "dirty", version: 1, dirty: true, want: "dirty"},
 	}
 	for _, tt := range tests {
@@ -241,7 +241,7 @@ func fixtureMigrations(first, second string) fs.FS {
 }
 
 func assertMigrationSchema(db *sql.DB) error {
-	if err := assertAppliedMigration(db, 1); err != nil {
+	if err := assertAppliedMigration(db, 2); err != nil {
 		return err
 	}
 	rows, err := db.Query("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
@@ -260,8 +260,8 @@ func assertMigrationSchema(db *sql.DB) error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	if len(tables) != 1 || tables[0] != "schema_migrations" {
-		return fmt.Errorf("application tables = %v, want only schema_migrations", tables)
+	if len(tables) != 2 || tables[0] != "replications" || tables[1] != "schema_migrations" {
+		return fmt.Errorf("application tables = %v, want replications and schema_migrations", tables)
 	}
 	var userVersion int
 	if err := db.QueryRow("PRAGMA user_version").Scan(&userVersion); err != nil {
@@ -271,6 +271,36 @@ func assertMigrationSchema(db *sql.DB) error {
 		return fmt.Errorf("user_version = %d, want untouched default 0", userVersion)
 	}
 	return nil
+}
+
+func TestOpenUpgradesPhaseOneSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "phase-one.db")
+	phaseOne, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := phaseOne.Exec("CREATE TABLE schema_migrations (version uint64, dirty bool)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := phaseOne.Exec("INSERT INTO schema_migrations(version, dirty) VALUES (1, false)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := phaseOne.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := Open(context.Background(), path, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("Open() upgrading Phase 1 database: %v", err)
+	}
+	defer db.Close()
+	if err := assertAppliedMigration(db, 2); err != nil {
+		t.Fatal(err)
+	}
+	var table string
+	if err := db.QueryRow("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'replications'").Scan(&table); err != nil {
+		t.Fatalf("replications table was not created: %v", err)
+	}
 }
 
 func assertAppliedMigration(db *sql.DB, expected int) error {
