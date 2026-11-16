@@ -48,6 +48,8 @@ func New(version string, runDaemon func(context.Context, string) error) *cobra.C
 	root.AddCommand(newTransfersCommand(opts))
 	root.AddCommand(newSyncCommand(opts))
 	root.AddCommand(newRetryCommand(opts))
+	root.AddCommand(newEvictCommand(opts))
+	root.AddCommand(newCacheActionCommand(opts, "restore"))
 	root.AddCommand(newVersionCommand(version, opts))
 	root.AddCommand(newConfigCommand(opts))
 	return root
@@ -165,6 +167,49 @@ func newRetryCommand(opts *options) *cobra.Command {
 	return newTransferActionCommand(opts, "retry", "Retry a failed or blocked transfer", func(hash string) string {
 		return "/api/v1/transfers/" + url.PathEscape(hash) + "/retry"
 	})
+}
+
+func newEvictCommand(opts *options) *cobra.Command {
+	command := newCacheActionCommand(opts, "evict")
+	command.AddCommand(&cobra.Command{
+		Use:   "plan",
+		Short: "Show disk pressure and automatic eviction candidates",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			var plan replication.EvictionPlan
+			if err := newAPIClient(opts.server).get(cmd.Context(), "/api/v1/evictions/plan", &plan); err != nil {
+				return err
+			}
+			if opts.jsonOutput {
+				return writeJSON(cmd.OutOrStdout(), plan)
+			}
+			return writeEvictionPlan(cmd.OutOrStdout(), plan)
+		},
+	})
+	return command
+}
+
+func newCacheActionCommand(opts *options, action string) *cobra.Command {
+	return &cobra.Command{
+		Use:   action + " <hash>",
+		Short: "Queue torrent payload " + action,
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			hash, err := transferHash(args[0])
+			if err != nil {
+				return err
+			}
+			var record replication.Record
+			if err := newAPIClient(opts.server).post(cmd.Context(), "/api/v1/torrents/"+url.PathEscape(hash)+"/"+action, &record); err != nil {
+				return err
+			}
+			if opts.jsonOutput {
+				return writeJSON(cmd.OutOrStdout(), record)
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "Torrent %s: %s queued (cache: %s)\n", cleanCell(record.Hash), action, record.CacheState)
+			return err
+		},
+	}
 }
 
 func newTransferActionCommand(opts *options, name, short string, endpoint func(string) string) *cobra.Command {
@@ -400,7 +445,7 @@ func writeTransfers(writer io.Writer, records []replication.Record) error {
 		return err
 	}
 	w := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(w, "HASH\tSIZE\tSTATE\tATTEMPTS\tLAST ATTEMPT\tVERIFIED\tERROR"); err != nil {
+	if _, err := fmt.Fprintln(w, "HASH\tSIZE\tSTATE\tCACHE\tOPERATION\tATTEMPTS\tLAST ATTEMPT\tVERIFIED\tERROR"); err != nil {
 		return err
 	}
 	for _, record := range records {
@@ -408,9 +453,9 @@ func writeTransfers(writer io.Writer, records []replication.Record) error {
 		if record.VerifiedAt != nil {
 			verified = "yes"
 		}
-		if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\t%s\t%s\n",
+		if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\n",
 			cleanCell(record.Hash), humanize.Bytes(uint64(max(record.Manifest.TotalSize, int64(0)))), cleanCell(string(record.State)),
-			record.Attempts, displayTime(record.LastAttemptAt), verified, cleanCell(record.LastError)); err != nil {
+			cleanCell(string(record.CacheState)), cleanCell(string(record.CacheOperation)), record.Attempts, displayTime(record.LastAttemptAt), verified, cleanCell(strings.TrimSpace(record.LastError+" "+record.CacheError))); err != nil {
 			return err
 		}
 	}
@@ -418,6 +463,9 @@ func writeTransfers(writer io.Writer, records []replication.Record) error {
 }
 
 func writeTransferDetail(writer io.Writer, record replication.Record) error {
+	if _, err := fmt.Fprintf(writer, "Cache: %s\nCache operation: %s\nCache error: %s\nEvicted at: %s\nRestored at: %s\n", record.CacheState, cleanCell(string(record.CacheOperation)), cleanCell(record.CacheError), displayTime(record.EvictedAt), displayTime(record.RestoredAt)); err != nil {
+		return err
+	}
 	if _, err := fmt.Fprintf(writer, "Hash: %s\nState: %s\nSelected size: %s\nSelected files: %d\nAttempts: %d\nLast attempt: %s\n",
 		cleanCell(record.Hash), cleanCell(string(record.State)),
 		humanize.Bytes(uint64(max(record.Manifest.TotalSize, int64(0)))), len(record.Manifest.Files), record.Attempts, displayTime(record.LastAttemptAt)); err != nil {
@@ -456,13 +504,13 @@ func writeTorrents(writer io.Writer, torrents []api.Torrent) error {
 		return err
 	}
 	w := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(w, "NAME\tSIZE\tPROGRESS\tRATIO\tSTATE\tHASH"); err != nil {
+	if _, err := fmt.Fprintln(w, "NAME\tSIZE\tPROGRESS\tRATIO\tSTATE\tCACHE\tHASH"); err != nil {
 		return err
 	}
 	for _, torrent := range torrents {
-		if _, err := fmt.Fprintf(w, "%s\t%s\t%.1f%%\t%.2f\t%s\t%s\n",
+		if _, err := fmt.Fprintf(w, "%s\t%s\t%.1f%%\t%.2f\t%s\t%s\t%s\n",
 			cleanCell(torrent.Name), humanize.Bytes(uint64(max(torrent.TotalSize, int64(0)))), torrent.Progress*100,
-			torrent.Ratio, cleanCell(torrent.State), cleanCell(torrent.Hash)); err != nil {
+			torrent.Ratio, cleanCell(torrent.State), cleanCell(string(torrent.CacheState)), cleanCell(torrent.Hash)); err != nil {
 			return err
 		}
 	}
@@ -471,6 +519,9 @@ func writeTorrents(writer io.Writer, torrents []api.Torrent) error {
 
 func writeTorrentDetail(writer io.Writer, detail api.TorrentDetail) error {
 	t := detail.Torrent
+	if _, err := fmt.Fprintf(writer, "Cache: %s\nCache error: %s\n", t.CacheState, cleanCell(t.CacheError)); err != nil {
+		return err
+	}
 	if _, err := fmt.Fprintf(writer, "Name: %s\nHash: %s\nState: %s\nProgress: %.1f%%\nSize: %s\nUploaded: %s\nRatio: %.2f\nSeeding time: %s\nSave path: %s\nAuto torrent management: %t\n",
 		cleanCell(t.Name), cleanCell(t.Hash), cleanCell(t.State), t.Progress*100,
 		humanize.Bytes(uint64(max(t.TotalSize, int64(0)))), humanize.Bytes(uint64(max(t.Uploaded, int64(0)))), t.Ratio,
@@ -509,4 +560,29 @@ func writeTorrentDetail(writer io.Writer, detail api.TorrentDetail) error {
 
 func cleanCell(value string) string {
 	return strings.NewReplacer("\n", " ", "\r", " ", "\t", " ").Replace(value)
+}
+
+func writeEvictionPlan(writer io.Writer, plan replication.EvictionPlan) error {
+	if _, err := fmt.Fprintf(writer, "Automatic eviction enabled: %t\nDisk pressure: %t\nFree space: %.1f%% (low: %.1f%%, target: %.1f%%)\n", plan.Enabled, plan.Triggered, plan.FreePercent, plan.LowFreePercent, plan.TargetFreePercent); err != nil {
+		return err
+	}
+	if plan.Message != "" {
+		if _, err := fmt.Fprintln(writer, cleanCell(plan.Message)); err != nil {
+			return err
+		}
+	}
+	if len(plan.Candidates) == 0 {
+		_, err := fmt.Fprintln(writer, "No safe eligible eviction candidates.")
+		return err
+	}
+	w := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
+	if _, err := fmt.Fprintln(w, "HASH\tNAME\tSIZE"); err != nil {
+		return err
+	}
+	for _, candidate := range plan.Candidates {
+		if _, err := fmt.Fprintf(w, "%s\t%s\t%s\n", cleanCell(candidate.Hash), cleanCell(candidate.Name), humanize.Bytes(uint64(max(candidate.TotalSize, int64(0))))); err != nil {
+			return err
+		}
+	}
+	return w.Flush()
 }

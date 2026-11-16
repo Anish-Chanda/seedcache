@@ -225,3 +225,76 @@ func TestEndpoints(t *testing.T) {
 		})
 	}
 }
+
+type lifecycleFixture struct {
+	transferFixture
+	operation string
+	hash      string
+	err       error
+}
+
+func (f *lifecycleFixture) Evict(_ context.Context, hash string) (replication.Record, error) {
+	f.operation, f.hash = "evict", hash
+	return f.record, f.err
+}
+func (f *lifecycleFixture) Restore(_ context.Context, hash string) (replication.Record, error) {
+	f.operation, f.hash = "restore", hash
+	return f.record, f.err
+}
+func (f *lifecycleFixture) EvictionPlan(context.Context) (replication.EvictionPlan, error) {
+	f.operation = "plan"
+	return replication.EvictionPlan{}, f.err
+}
+
+func TestCacheLifecycleEndpoints(t *testing.T) {
+	for _, test := range []struct {
+		method, path, operation string
+		status                  int
+	}{
+		{"GET", "/api/v1/evictions/plan", "plan", 200},
+		{"POST", "/api/v1/torrents/abc/evict", "evict", 202},
+		{"POST", "/api/v1/torrents/abc/restore", "restore", 202},
+		{"GET", "/api/v1/torrents/abc/evict", "", 405},
+		{"POST", "/api/v1/evictions/plan", "", 405},
+	} {
+		t.Run(test.method+test.path, func(t *testing.T) {
+			service := &lifecycleFixture{transferFixture: transferFixture{record: replication.Record{Hash: "abc", CacheState: "evicted"}}}
+			handler := New(fixture{}, "test", zerolog.Nop(), service)
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, httptest.NewRequest(test.method, test.path, nil))
+			if w.Code != test.status || service.operation != test.operation {
+				t.Fatalf("status=%d operation=%s body=%s", w.Code, service.operation, w.Body.String())
+			}
+			if test.operation == "evict" || test.operation == "restore" {
+				if service.hash != "abc" {
+					t.Fatalf("hash=%q", service.hash)
+				}
+			}
+		})
+	}
+	for _, err := range []error{replication.ErrConflict, &replication.BlockedError{Reason: "shared payload"}} {
+		service := &lifecycleFixture{err: err}
+		w := httptest.NewRecorder()
+		New(fixture{}, "test", zerolog.Nop(), service).ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/torrents/abc/evict", nil))
+		if w.Code != 409 {
+			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+		}
+	}
+	w := httptest.NewRecorder()
+	New(fixture{}, "test", zerolog.Nop()).ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/torrents/abc/restore", nil))
+	if w.Code != 503 {
+		t.Fatalf("disabled status=%d", w.Code)
+	}
+}
+
+func TestTorrentResponsesExposeCacheState(t *testing.T) {
+	service := &transferFixture{record: replication.Record{Hash: "abc", CacheState: "evicted", CacheError: "restore failed"}}
+	handler := New(fixture{}, "test", zerolog.Nop(), service)
+	for _, path := range []string{"/api/v1/torrents", "/api/v1/torrents/abc"} {
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, httptest.NewRequest("GET", path, nil))
+		if w.Code != 200 || !strings.Contains(w.Body.String(), `"cache_state":"evicted"`) || !strings.Contains(w.Body.String(), `"cache_error":"restore failed"`) {
+			t.Fatalf("%s: %d %s", path, w.Code, w.Body.String())
+		}
+	}
+}

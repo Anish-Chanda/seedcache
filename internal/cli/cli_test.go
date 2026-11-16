@@ -331,3 +331,32 @@ func TestServerURLFromEnvironmentAndFlag(t *testing.T) {
 		})
 	}
 }
+
+func TestCacheCommandsUseDaemonAPI(t *testing.T) {
+	for _, test := range []struct {
+		args               []string
+		method, path, body string
+	}{
+		{[]string{"evict", "abc"}, "POST", "/api/v1/torrents/abc/evict", `{"hash":"abc","cache_state":"present","cache_operation":"evict"}`},
+		{[]string{"restore", "abc"}, "POST", "/api/v1/torrents/abc/restore", `{"hash":"abc","cache_state":"evicted","cache_operation":"restore"}`},
+		{[]string{"evict", "plan"}, "GET", "/api/v1/evictions/plan", `{"enabled":false,"free_percent":5,"low_free_percent":10,"target_free_percent":20,"candidates":[]}`},
+	} {
+		t.Run(strings.Join(test.args, " "), func(t *testing.T) {
+			withTransport(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if r.Method != test.method || r.URL.Path != test.path {
+					t.Fatalf("request=%s %s", r.Method, r.URL.Path)
+				}
+				return apiResponse(202, test.body), nil
+			}))
+			args := append([]string{"--json"}, test.args...)
+			output, err := execute(t, New("test", nil), args...)
+			if err != nil || !json.Valid([]byte(output)) {
+				t.Fatalf("output=%s error=%v", output, err)
+			}
+			output, err = execute(t, New("test", nil), test.args...)
+			if err != nil || output == "" {
+				t.Fatalf("human output=%s error=%v", output, err)
+			}
+		})
+	}
+}

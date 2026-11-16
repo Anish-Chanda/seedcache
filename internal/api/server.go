@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/anish-chanda/seedcache/internal/replication"
@@ -28,11 +29,18 @@ type Transfers interface {
 	Summary(context.Context) (replication.Summary, error)
 }
 
+type Lifecycle interface {
+	Evict(context.Context, string) (replication.Record, error)
+	Restore(context.Context, string) (replication.Record, error)
+	EvictionPlan(context.Context) (replication.EvictionPlan, error)
+}
+
 func New(discovery Discovery, version string, log zerolog.Logger, transferServices ...Transfers) http.Handler {
 	var transfers Transfers
 	if len(transferServices) > 0 {
 		transfers = transferServices[0]
 	}
+	lifecycle, _ := transfers.(Lifecycle)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "endpoint not found")
@@ -58,6 +66,20 @@ func New(discovery Discovery, version string, log zerolog.Logger, transferServic
 				writeError(w, http.StatusServiceUnavailable, "qbittorrent_unavailable", ErrUnavailable.Error())
 				return
 			}
+			if transfers != nil {
+				records, err := transfers.List(r.Context())
+				if err != nil {
+					writeOperationError(w, err, "cache")
+					return
+				}
+				byHash := make(map[string]replication.Record, len(records))
+				for _, record := range records {
+					byHash[record.Hash] = record
+				}
+				for i := range torrents {
+					applyCache(&torrents[i], byHash[strings.ToLower(torrents[i].Hash)])
+				}
+			}
 			writeJSON(w, http.StatusOK, TorrentList{Torrents: torrents})
 		},
 		"/api/v1/torrents/{hash}": func(w http.ResponseWriter, r *http.Request) {
@@ -68,12 +90,50 @@ func New(discovery Discovery, version string, log zerolog.Logger, transferServic
 			case err != nil:
 				writeError(w, http.StatusServiceUnavailable, "qbittorrent_unavailable", ErrUnavailable.Error())
 			default:
+				if transfers != nil {
+					record, err := transfers.Get(r.Context(), detail.Hash)
+					if err != nil && !errors.Is(err, replication.ErrNotFound) {
+						writeOperationError(w, err, "cache")
+						return
+					}
+					applyCache(&detail.Torrent, record)
+				}
 				writeJSON(w, http.StatusOK, detail)
 			}
 		},
 	}
 	for path, handler := range routes {
 		mux.HandleFunc(path, allowMethod(http.MethodGet, handler))
+	}
+	mux.HandleFunc("/api/v1/evictions/plan", allowMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
+		if lifecycle == nil {
+			writeTransferUnavailable(w)
+			return
+		}
+		plan, err := lifecycle.EvictionPlan(r.Context())
+		if err != nil {
+			writeOperationError(w, err, "eviction")
+			return
+		}
+		writeJSON(w, http.StatusOK, plan)
+	}))
+	for _, action := range []string{"evict", "restore"} {
+		mux.HandleFunc("/api/v1/torrents/{hash}/"+action, allowMethod(http.MethodPost, func(w http.ResponseWriter, r *http.Request) {
+			if lifecycle == nil {
+				writeTransferUnavailable(w)
+				return
+			}
+			operation := lifecycle.Evict
+			if action == "restore" {
+				operation = lifecycle.Restore
+			}
+			record, err := operation(r.Context(), r.PathValue("hash"))
+			if err != nil {
+				writeOperationError(w, err, "cache")
+				return
+			}
+			writeJSON(w, http.StatusAccepted, record)
+		}))
 	}
 	mux.HandleFunc("/api/v1/transfers", allowMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
 		if transfers == nil {
@@ -140,6 +200,15 @@ func New(discovery Discovery, version string, log zerolog.Logger, transferServic
 			log.WithLevel(level).Dur("duration", time.Since(start)).Msgf("%d %s %s", sw.status, r.Method, r.URL.Path)
 		}
 	})
+}
+
+func applyCache(torrent *Torrent, record replication.Record) {
+	torrent.CacheState = record.CacheState
+	if torrent.CacheState == "" {
+		torrent.CacheState = "present"
+	}
+	torrent.CacheError = record.CacheError
+	torrent.CacheOperation = record.CacheOperation
 }
 
 func allowMethod(method string, handler http.HandlerFunc) http.HandlerFunc {
