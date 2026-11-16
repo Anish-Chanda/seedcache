@@ -102,6 +102,62 @@ func TestRepositoryEmptyQueueAndDuplicateInsert(t *testing.T) {
 	}
 }
 
+func TestRepositoryPersistsAndRecoversCacheOperations(t *testing.T) {
+	db, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "cache.db"), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repo := &repository{db: db}
+	now := time.Now().UTC().Truncate(time.Nanosecond)
+	manifest := Manifest{Files: []File{{Path: "media/file.bin", Size: 19, Index: 0}}, TotalSize: 19}
+	initial := Record{
+		Hash:                "abc123",
+		State:               StateReplicated,
+		Manifest:            manifest,
+		ManifestFingerprint: manifest.Fingerprint(),
+		SourceIdentity:      "source",
+		DestinationIdentity: "destination",
+		CreatedAt:           now,
+		UpdatedAt:           now,
+		VerifiedAt:          &now,
+	}
+	created, inserted, err := repo.createIfAbsent(context.Background(), initial)
+	if err != nil || !inserted {
+		t.Fatalf("createIfAbsent() = inserted %t, err %v", inserted, err)
+	}
+	if created.CacheState != CachePresent || !created.CacheUpdatedAt.Equal(now) {
+		t.Fatalf("default cache state = %+v, want present at creation time", created)
+	}
+	queued := created
+	queued.CacheOperation = CacheOperationEvict
+	queued.CacheUpdatedAt = now.Add(time.Second)
+	changed, err := repo.replaceCache(context.Background(), created, queued)
+	if err != nil || !changed {
+		t.Fatalf("replaceCache() = changed %t, err %v", changed, err)
+	}
+	operation, found, err := repo.nextCacheOperation(context.Background())
+	if err != nil || !found || operation.CacheOperation != CacheOperationEvict {
+		t.Fatalf("nextCacheOperation() = (%+v, %t, %v)", operation, found, err)
+	}
+	withError := operation
+	withError.CacheError = "interrupted"
+	withError.CacheUpdatedAt = now.Add(2 * time.Second)
+	if changed, err := repo.replaceCache(context.Background(), operation, withError); err != nil || !changed {
+		t.Fatalf("persist cache error = changed %t, err %v", changed, err)
+	}
+	if _, found, err := repo.nextCacheOperation(context.Background()); err != nil || found {
+		t.Fatalf("failed operation was runnable before recovery: found=%t err=%v", found, err)
+	}
+	if err := repo.recoverCacheOperations(context.Background(), now.Add(3*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	recovered, found, err := repo.nextCacheOperation(context.Background())
+	if err != nil || !found || recovered.CacheError != "" || recovered.CacheOperation != CacheOperationEvict {
+		t.Fatalf("recovered cache operation = (%+v, %t, %v)", recovered, found, err)
+	}
+}
+
 func TestRetryDelayIsExponentialAndBounded(t *testing.T) {
 	tests := []struct {
 		attempt int

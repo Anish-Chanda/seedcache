@@ -41,7 +41,7 @@ func TestOpenInitializesMigrationsAndNoOpLogs(t *testing.T) {
 		t.Fatalf("reopen() error = %v", err)
 	}
 	defer db.Close()
-	if err := assertAppliedMigration(db, 2); err != nil {
+	if err := assertAppliedMigration(db, 3); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(logs.String(), "SQLite database schema is up to date") {
@@ -88,7 +88,7 @@ func TestOpenPreservesExistingDataAndUserVersion(t *testing.T) {
 	if userVersion != 1 {
 		t.Errorf("user_version = %d, want preserved value 1", userVersion)
 	}
-	if err := assertAppliedMigration(db, 2); err != nil {
+	if err := assertAppliedMigration(db, 3); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -127,7 +127,7 @@ func TestRunMigrationsAppliesFilesystemFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 	if version != 2 {
-		t.Errorf("migration version = %d, want 2", version)
+		t.Errorf("fixture migration version = %d, want 2", version)
 	}
 }
 
@@ -160,7 +160,7 @@ func TestOpenRejectsNewerAndDirtyMigrationVersions(t *testing.T) {
 		dirty   bool
 		want    string
 	}{
-		{name: "newer", version: 3, want: "no migration found for version 3"},
+		{name: "newer", version: 4, want: "no migration found for version 4"},
 		{name: "dirty", version: 1, dirty: true, want: "dirty"},
 	}
 	for _, tt := range tests {
@@ -241,8 +241,46 @@ func fixtureMigrations(first, second string) fs.FS {
 }
 
 func assertMigrationSchema(db *sql.DB) error {
-	if err := assertAppliedMigration(db, 2); err != nil {
+	if err := assertAppliedMigration(db, 3); err != nil {
 		return err
+	}
+	columns, err := db.Query("PRAGMA table_info(replications)")
+	if err != nil {
+		return err
+	}
+	var foundCacheState, foundCacheOperation, foundCacheUpdatedAt, foundCacheError, foundEvictedAt, foundRestoredAt bool
+	for columns.Next() {
+		var cid, notnull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := columns.Scan(&cid, &name, &columnType, &notnull, &defaultValue, &primaryKey); err != nil {
+			_ = columns.Close()
+			return err
+		}
+		switch name {
+		case "cache_state":
+			foundCacheState = defaultValue.Valid && defaultValue.String == "'present'"
+		case "cache_operation":
+			foundCacheOperation = defaultValue.Valid && defaultValue.String == "''"
+		case "cache_updated_at":
+			foundCacheUpdatedAt = true
+		case "cache_error":
+			foundCacheError = defaultValue.Valid && defaultValue.String == "''"
+		case "evicted_at":
+			foundEvictedAt = true
+		case "restored_at":
+			foundRestoredAt = true
+		}
+	}
+	if err := columns.Err(); err != nil {
+		_ = columns.Close()
+		return err
+	}
+	if err := columns.Close(); err != nil {
+		return err
+	}
+	if !foundCacheState || !foundCacheOperation || !foundCacheUpdatedAt || !foundCacheError || !foundEvictedAt || !foundRestoredAt {
+		return fmt.Errorf("replications cache lifecycle columns missing or have incorrect defaults")
 	}
 	rows, err := db.Query("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
 	if err != nil {
@@ -294,7 +332,7 @@ func TestOpenUpgradesPhaseOneSchema(t *testing.T) {
 		t.Fatalf("Open() upgrading Phase 1 database: %v", err)
 	}
 	defer db.Close()
-	if err := assertAppliedMigration(db, 2); err != nil {
+	if err := assertAppliedMigration(db, 3); err != nil {
 		t.Fatal(err)
 	}
 	var table string

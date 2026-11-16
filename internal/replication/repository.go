@@ -82,15 +82,24 @@ func (r *repository) createIfAbsent(ctx context.Context, record Record) (Record,
 	if err != nil {
 		return Record{}, false, err
 	}
+	if record.CacheState == "" {
+		record.CacheState = CachePresent
+	}
+	if record.CacheUpdatedAt.IsZero() {
+		record.CacheUpdatedAt = record.UpdatedAt
+	}
 	result, err := r.db.ExecContext(ctx, `INSERT INTO replications (
 		hash, state, manifest, manifest_fingerprint, source_identity, destination_identity,
-		attempts, created_at, updated_at, last_attempt_at, next_attempt_at, verified_at, last_error
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		attempts, created_at, updated_at, last_attempt_at, next_attempt_at, verified_at, last_error,
+		cache_state, cache_operation, cache_updated_at, cache_error, evicted_at, restored_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(hash) DO NOTHING`,
 		record.Hash, record.State, manifest, record.ManifestFingerprint,
 		record.SourceIdentity, record.DestinationIdentity, record.Attempts,
 		formatTime(record.CreatedAt), formatTime(record.UpdatedAt), nullableTime(record.LastAttemptAt),
-		nullableTime(record.NextAttemptAt), nullableTime(record.VerifiedAt), record.LastError)
+		nullableTime(record.NextAttemptAt), nullableTime(record.VerifiedAt), record.LastError,
+		record.CacheState, record.CacheOperation, formatTime(record.CacheUpdatedAt), record.CacheError,
+		nullableTime(record.EvictedAt), nullableTime(record.RestoredAt))
 	if err != nil {
 		return Record{}, false, fmt.Errorf("create replication %s: %w", record.Hash, err)
 	}
@@ -139,12 +148,52 @@ func (r *repository) replace(ctx context.Context, record Record, expected ...Sta
 	return changed != 0, nil
 }
 
+func (r *repository) replaceCache(ctx context.Context, expected, updated Record) (bool, error) {
+	result, err := r.db.ExecContext(ctx, `UPDATE replications SET
+		cache_state = ?, cache_operation = ?, cache_updated_at = ?, cache_error = ?,
+		evicted_at = ?, restored_at = ?
+		WHERE hash = ? AND cache_state = ? AND cache_operation = ? AND cache_error = ? AND cache_updated_at = ?`,
+		updated.CacheState, updated.CacheOperation, formatTime(updated.CacheUpdatedAt), updated.CacheError,
+		nullableTime(updated.EvictedAt), nullableTime(updated.RestoredAt),
+		expected.Hash, expected.CacheState, expected.CacheOperation, expected.CacheError, formatTime(expected.CacheUpdatedAt))
+	if err != nil {
+		return false, fmt.Errorf("update cache lifecycle for %s: %w", updated.Hash, err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("check cache lifecycle update for %s: %w", updated.Hash, err)
+	}
+	return changed != 0, nil
+}
+
+func (r *repository) nextCacheOperation(ctx context.Context) (Record, bool, error) {
+	record, err := scanRecord(r.db.QueryRowContext(ctx, selectRecordSQL+` WHERE cache_operation <> '' AND cache_error = ''
+		ORDER BY cache_updated_at, hash LIMIT 1`))
+	if errors.Is(err, ErrNotFound) {
+		return Record{}, false, nil
+	}
+	if err != nil {
+		return Record{}, false, err
+	}
+	return record, true, nil
+}
+
+func (r *repository) recoverCacheOperations(ctx context.Context, now time.Time) error {
+	_, err := r.db.ExecContext(ctx, `UPDATE replications SET cache_error = '', cache_updated_at = ?
+		WHERE cache_operation <> ''`, formatTime(now))
+	if err != nil {
+		return fmt.Errorf("recover interrupted cache operations: %w", err)
+	}
+	return nil
+}
+
 func (r *repository) start(ctx context.Context, hash string, now time.Time) (Record, bool, error) {
 	result, err := r.db.ExecContext(ctx, `UPDATE replications SET state = ?, attempts = attempts + 1,
 		last_attempt_at = ?, next_attempt_at = NULL, updated_at = ?, last_error = ''
-		WHERE hash = ? AND state IN (?, ?) AND (next_attempt_at IS NULL OR next_attempt_at <= ?)`,
+		WHERE hash = ? AND state IN (?, ?) AND cache_state = ? AND cache_operation = ''
+		AND (next_attempt_at IS NULL OR next_attempt_at <= ?)`,
 		StateTransferring, formatTime(now), formatTime(now), hash,
-		StatePending, StateFailed, formatTime(now))
+		StatePending, StateFailed, CachePresent, formatTime(now))
 	if err != nil {
 		return Record{}, false, fmt.Errorf("start replication %s: %w", hash, err)
 	}
@@ -160,9 +209,9 @@ func (r *repository) start(ctx context.Context, hash string, now time.Time) (Rec
 }
 
 func (r *repository) nextReady(ctx context.Context, now time.Time) (Record, bool, error) {
-	record, err := scanRecord(r.db.QueryRowContext(ctx, selectRecordSQL+` WHERE state = ? OR
-		(state = ? AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
-		ORDER BY created_at, hash LIMIT 1`, StatePending, StateFailed, formatTime(now)))
+	record, err := scanRecord(r.db.QueryRowContext(ctx, selectRecordSQL+` WHERE cache_state = ? AND cache_operation = '' AND (state = ? OR
+		(state = ? AND (next_attempt_at IS NULL OR next_attempt_at <= ?)))
+		ORDER BY created_at, hash LIMIT 1`, CachePresent, StatePending, StateFailed, formatTime(now)))
 	if errors.Is(err, ErrNotFound) {
 		return Record{}, false, nil
 	}
@@ -176,8 +225,8 @@ func (r *repository) nextDue(ctx context.Context, now time.Time) (*time.Time, er
 	var due sql.NullString
 	err := r.db.QueryRowContext(ctx, `SELECT MIN(CASE
 		WHEN state = ? THEN ? ELSE next_attempt_at END)
-		FROM replications WHERE state = ? OR state = ?`,
-		StatePending, formatTime(now), StatePending, StateFailed).Scan(&due)
+		FROM replications WHERE cache_state = ? AND cache_operation = '' AND (state = ? OR state = ?)`,
+		StatePending, formatTime(now), CachePresent, StatePending, StateFailed).Scan(&due)
 	if err != nil {
 		return nil, fmt.Errorf("read next replication retry: %w", err)
 	}
@@ -203,7 +252,8 @@ func (r *repository) recoverInterrupted(ctx context.Context, now time.Time) erro
 
 const selectRecordSQL = `SELECT hash, state, manifest, manifest_fingerprint, source_identity,
 	destination_identity, attempts, created_at, updated_at, last_attempt_at, next_attempt_at,
-	verified_at, last_error FROM replications`
+	verified_at, last_error, cache_state, cache_operation, cache_updated_at, cache_error, evicted_at,
+	restored_at FROM replications`
 
 type rowScanner interface {
 	Scan(dest ...any) error
@@ -212,12 +262,13 @@ type rowScanner interface {
 func scanRecord(row rowScanner) (Record, error) {
 	var record Record
 	var manifestJSON string
-	var createdAt, updatedAt string
-	var lastAttemptAt, nextAttemptAt, verifiedAt sql.NullString
+	var createdAt, updatedAt, cacheUpdatedAt string
+	var lastAttemptAt, nextAttemptAt, verifiedAt, evictedAt, restoredAt sql.NullString
 	if err := row.Scan(
 		&record.Hash, &record.State, &manifestJSON, &record.ManifestFingerprint,
 		&record.SourceIdentity, &record.DestinationIdentity, &record.Attempts,
 		&createdAt, &updatedAt, &lastAttemptAt, &nextAttemptAt, &verifiedAt, &record.LastError,
+		&record.CacheState, &record.CacheOperation, &cacheUpdatedAt, &record.CacheError, &evictedAt, &restoredAt,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Record{}, fmt.Errorf("%w", ErrNotFound)
@@ -234,6 +285,9 @@ func scanRecord(row rowScanner) (Record, error) {
 	if record.UpdatedAt, err = parseTime(updatedAt); err != nil {
 		return Record{}, fmt.Errorf("parse replication %s update time: %w", record.Hash, err)
 	}
+	if record.CacheUpdatedAt, err = parseTime(cacheUpdatedAt); err != nil {
+		return Record{}, fmt.Errorf("parse replication %s cache update time: %w", record.Hash, err)
+	}
 	if record.LastAttemptAt, err = parseNullableTime(lastAttemptAt); err != nil {
 		return Record{}, fmt.Errorf("parse replication %s last attempt: %w", record.Hash, err)
 	}
@@ -242,6 +296,12 @@ func scanRecord(row rowScanner) (Record, error) {
 	}
 	if record.VerifiedAt, err = parseNullableTime(verifiedAt); err != nil {
 		return Record{}, fmt.Errorf("parse replication %s verification time: %w", record.Hash, err)
+	}
+	if record.EvictedAt, err = parseNullableTime(evictedAt); err != nil {
+		return Record{}, fmt.Errorf("parse replication %s eviction time: %w", record.Hash, err)
+	}
+	if record.RestoredAt, err = parseNullableTime(restoredAt); err != nil {
+		return Record{}, fmt.Errorf("parse replication %s restoration time: %w", record.Hash, err)
 	}
 	return record, nil
 }
