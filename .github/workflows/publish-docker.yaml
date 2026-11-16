@@ -2,9 +2,11 @@ name: Publish Docker image
 
 on:
   workflow_dispatch:
+  release:
+    types: [published]
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 env:
@@ -15,15 +17,46 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Require main branch
+        if: github.event_name == 'workflow_dispatch'
         run: |
           if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
             echo '::error::Docker publishing is only allowed from the main branch.'
             exit 1
           fi
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Require release commit on main
+        if: github.event_name == 'release'
+        run: |
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo '::error::The release commit must be reachable from main.'
+            exit 1
+          fi
       - name: Compute commit tag
         id: revision
-        run: echo "short_sha=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+        run: |
+          commit=$(git rev-parse HEAD)
+          echo "short_sha=${commit::12}" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@v7
+        if: github.event_name == 'release'
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build Linux release binary
+        if: github.event_name == 'release'
+        env:
+          SHORT_SHA: ${{ steps.revision.outputs.short_sha }}
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags="-s -w -X main.version=$SHORT_SHA" \
+            -o dist/seedcache-linux-amd64 ./cmd/seedcache
+      - name: Generate release checksum
+        if: github.event_name == 'release'
+        working-directory: dist
+        run: sha256sum seedcache-linux-amd64 > seedcache-linux-amd64.sha256
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
       - name: Log in to GHCR
@@ -39,8 +72,16 @@ jobs:
           file: docker/Dockerfile
           platforms: linux/amd64
           push: true
-          tags: |
-            ${{ env.IMAGE }}:dev
-            ${{ env.IMAGE }}:sha-${{ steps.revision.outputs.short_sha }}
+          tags: ${{ env.IMAGE }}:sha-${{ steps.revision.outputs.short_sha }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+      - name: Upload release assets
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release upload "$RELEASE_TAG" \
+            dist/seedcache-linux-amd64 \
+            dist/seedcache-linux-amd64.sha256
