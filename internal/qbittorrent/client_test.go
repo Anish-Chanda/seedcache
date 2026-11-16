@@ -75,7 +75,7 @@ func TestReadMethodsDecodeDocumentedEndpoints(t *testing.T) {
 		if got := r.URL.Query().Get("hashes"); got != "" && got != testHash {
 			t.Errorf("torrents/info hashes = %q", got)
 		}
-		_, _ = io.WriteString(w, `[{"hash":"`+testHash+`","name":"Example","state":"uploading","progress":1,"total_size":4096,"size":2048,"amount_left":0,"content_path":"/data/Example","uploaded":8192,"ratio":2,"seeding_time":3600,"save_path":"/data","completion_on":1700000000,"auto_tmm":true}]`)
+		_, _ = io.WriteString(w, `[{"hash":"`+testHash+`","name":"Example","state":"uploading","progress":1,"total_size":4096,"size":2048,"amount_left":0,"content_path":"/data/Example","uploaded":8192,"ratio":2,"seeding_time":3600,"last_activity":1700000012,"save_path":"/data","download_path":"/incomplete","completion_on":1700000000,"auto_tmm":true}]`)
 	})
 	mux.HandleFunc("/api/v2/torrents/properties", func(w http.ResponseWriter, r *http.Request) {
 		requireReadRequest(t, r, "sid-1", "GET")
@@ -168,8 +168,419 @@ func assertTorrent(t *testing.T, got Torrent) {
 	t.Helper()
 	if got.Hash != testHash || got.Name != "Example" || got.State != "uploading" || got.Progress != 1 ||
 		got.TotalSize != 4096 || got.Uploaded != 8192 || got.Ratio != 2 || got.SeedingTime != 3600 ||
-		got.Size != 2048 || got.AmountLeft != 0 || got.ContentPath != "/data/Example" || got.SavePath != "/data" || got.CompletionOn != 1700000000 || !got.AutoTMM {
+		got.LastActivity != 1700000012 ||
+		got.Size != 2048 || got.AmountLeft != 0 || got.ContentPath != "/data/Example" || got.SavePath != "/data" ||
+		got.DownloadPath != "/incomplete" || got.CompletionOn != 1700000000 || !got.AutoTMM {
 		t.Errorf("Torrent = %#v", got)
+	}
+}
+
+func TestMutationMethodsPostOneExactHashAndConfirmStates(t *testing.T) {
+	var logins atomic.Int32
+	var state atomic.Value
+	state.Store("uploading")
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v2/auth/login", loginHandler(t, &logins))
+	mux.HandleFunc("/api/v2/torrents/stop", func(w http.ResponseWriter, r *http.Request) {
+		requireMutationRequest(t, r, "stop", testHash)
+		state.Store("stoppedUP")
+		_, _ = io.WriteString(w, "Ok.")
+	})
+	mux.HandleFunc("/api/v2/torrents/start", func(w http.ResponseWriter, r *http.Request) {
+		requireMutationRequest(t, r, "start", testHash)
+		state.Store("queuedUP")
+		_, _ = io.WriteString(w, "Ok.")
+	})
+	mux.HandleFunc("/api/v2/torrents/info", func(w http.ResponseWriter, r *http.Request) {
+		requireReadRequest(t, r, "sid-1", http.MethodGet)
+		if got := r.URL.Query().Get("hashes"); got != testHash {
+			t.Errorf("torrents/info hashes = %q, want exact hash", got)
+		}
+		current := state.Load().(string)
+		if r.URL.Query().Get("filter") == "stopped" && current != "stoppedUP" && current != "stoppedDL" {
+			_, _ = io.WriteString(w, `[]`)
+			return
+		}
+		_, _ = io.WriteString(w, `[{"hash":"`+testHash+`","state":"`+current+`","progress":1,"amount_left":0}]`)
+	})
+	client, _ := newTestClient(t, mux)
+
+	if err := client.Stop(context.Background(), testHash); err != nil {
+		t.Fatalf("Stop() error: %v", err)
+	}
+	if err := client.Start(context.Background(), testHash); err != nil {
+		t.Fatalf("Start() error: %v", err)
+	}
+	if got := logins.Load(); got != 1 {
+		t.Errorf("login calls = %d, want one shared SID", got)
+	}
+}
+
+func TestRecheckWaitsForSuccessfulSelectedFileCheck(t *testing.T) {
+	var logins atomic.Int32
+	var state atomic.Value
+	state.Store("stoppedUP")
+	var recheckCalls atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v2/auth/login", loginHandler(t, &logins))
+	mux.HandleFunc("/api/v2/torrents/recheck", func(w http.ResponseWriter, r *http.Request) {
+		requireMutationRequest(t, r, "recheck", testHash)
+		if recheckCalls.Add(1) == 1 {
+			state.Store("checkingUP")
+		}
+		_, _ = io.WriteString(w, "Ok.")
+	})
+	mux.HandleFunc("/api/v2/torrents/info", func(w http.ResponseWriter, r *http.Request) {
+		requireReadRequest(t, r, "sid-1", http.MethodGet)
+		if r.URL.Query().Get("filter") == "stopped" {
+			if state.Load().(string) == "stoppedUP" {
+				_, _ = io.WriteString(w, `[{"hash":"`+testHash+`","state":"stoppedUP"}]`)
+				return
+			}
+			_, _ = io.WriteString(w, `[]`)
+			return
+		}
+		if got := r.URL.Query().Get("hashes"); got != testHash {
+			t.Errorf("torrents/info hashes = %q, want exact hash", got)
+		}
+		if state.Load().(string) == "checkingUP" {
+			// Expose the check state once so the client can confirm it started.
+			if recheckCalls.Load() > 0 {
+				state.Store("stoppedUP")
+				_, _ = io.WriteString(w, `[{"hash":"`+testHash+`","state":"checkingUP"}]`)
+				return
+			}
+		}
+		_, _ = io.WriteString(w, `[{"hash":"`+testHash+`","state":"`+state.Load().(string)+`"}]`)
+	})
+	mux.HandleFunc("/api/v2/torrents/files", func(w http.ResponseWriter, r *http.Request) {
+		requireReadRequest(t, r, "sid-1", http.MethodGet)
+		if got := r.URL.Query().Get("hash"); got != testHash {
+			t.Errorf("torrents/files hash = %q, want exact hash", got)
+		}
+		_, _ = io.WriteString(w, `[{"index":0,"name":"selected.bin","size":4,"priority":1,"progress":1},{"index":1,"name":"ignored.bin","size":4,"priority":0,"progress":0},{"index":2,"name":"selected-empty.bin","size":0,"priority":1,"progress":0}]`)
+	})
+	client, _ := newTestClient(t, mux)
+
+	if err := client.Recheck(context.Background(), testHash); err != nil {
+		t.Fatalf("Recheck() error: %v", err)
+	}
+	if got := recheckCalls.Load(); got != 1 {
+		t.Errorf("recheck calls = %d, want 1", got)
+	}
+}
+
+func TestRecheckAcceptsStoppedIncompleteToCompleteTransition(t *testing.T) {
+	var recheckCalls atomic.Int32
+	var checked atomic.Bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v2/auth/login", loginHandler(t, new(atomic.Int32)))
+	mux.HandleFunc("/api/v2/torrents/recheck", func(w http.ResponseWriter, r *http.Request) {
+		requireMutationRequest(t, r, "recheck", testHash)
+		recheckCalls.Add(1)
+		checked.Store(true)
+		_, _ = io.WriteString(w, "Ok.")
+	})
+	mux.HandleFunc("/api/v2/torrents/info", func(w http.ResponseWriter, r *http.Request) {
+		requireReadRequest(t, r, "sid-1", http.MethodGet)
+		if r.URL.Query().Get("filter") == "stopped" {
+			_, _ = io.WriteString(w, `[{"hash":"`+testHash+`","state":"stoppedDL"}]`)
+			return
+		}
+		_, _ = io.WriteString(w, `[{"hash":"`+testHash+`","state":"stoppedDL"}]`)
+	})
+	mux.HandleFunc("/api/v2/torrents/files", func(w http.ResponseWriter, r *http.Request) {
+		requireReadRequest(t, r, "sid-1", http.MethodGet)
+		if checked.Load() {
+			_, _ = io.WriteString(w, `[{"index":0,"name":"selected.bin","size":4,"priority":1,"progress":1}]`)
+			return
+		}
+		_, _ = io.WriteString(w, `[{"index":0,"name":"selected.bin","size":4,"priority":1,"progress":0}]`)
+	})
+	client, _ := newTestClient(t, mux)
+
+	if err := client.Recheck(context.Background(), testHash); err != nil {
+		t.Fatalf("Recheck() error: %v", err)
+	}
+	if got := recheckCalls.Load(); got != 1 {
+		t.Errorf("recheck calls = %d, want 1", got)
+	}
+}
+
+func TestRecheckUsesCheckingFilterWhenStatePulseIsMissed(t *testing.T) {
+	var checking atomic.Bool
+	var checkingFilterCalls atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v2/auth/login", loginHandler(t, new(atomic.Int32)))
+	mux.HandleFunc("/api/v2/torrents/recheck", func(w http.ResponseWriter, r *http.Request) {
+		requireMutationRequest(t, r, "recheck", testHash)
+		checking.Store(true)
+		_, _ = io.WriteString(w, "Ok.")
+	})
+	mux.HandleFunc("/api/v2/torrents/info", func(w http.ResponseWriter, r *http.Request) {
+		requireReadRequest(t, r, "sid-1", http.MethodGet)
+		if got := r.URL.Query().Get("hashes"); got != testHash {
+			t.Errorf("torrents/info hashes = %q, want exact hash", got)
+		}
+		switch r.URL.Query().Get("filter") {
+		case "stopped":
+			_, _ = io.WriteString(w, "[{\"hash\":\""+testHash+"\",\"state\":\"stoppedUP\"}]")
+		case "checking":
+			checkingFilterCalls.Add(1)
+			if checking.Swap(false) {
+				// The qB checking filter catches a check that did not appear in
+				// the per-torrent state response.
+				_, _ = io.WriteString(w, "[{\"hash\":\""+testHash+"\",\"state\":\"stoppedUP\"}]")
+				return
+			}
+			_, _ = io.WriteString(w, "[]")
+		default:
+			_, _ = io.WriteString(w, "[{\"hash\":\""+testHash+"\",\"state\":\"stoppedUP\"}]")
+		}
+	})
+	mux.HandleFunc("/api/v2/torrents/files", func(w http.ResponseWriter, r *http.Request) {
+		requireReadRequest(t, r, "sid-1", http.MethodGet)
+		_, _ = io.WriteString(w, "[{\"index\":0,\"name\":\"selected.bin\",\"size\":4,\"priority\":1,\"progress\":1}]")
+	})
+	client, _ := newTestClient(t, mux)
+
+	if err := client.Recheck(context.Background(), testHash); err != nil {
+		t.Fatalf("Recheck() error: %v", err)
+	}
+	if got := checkingFilterCalls.Load(); got < 3 {
+		t.Errorf("checking filter calls = %d, want baseline, start, and finish polls", got)
+	}
+}
+
+func TestRecheckRejectsIncompleteSelectedFile(t *testing.T) {
+	var state atomic.Value
+	state.Store("stoppedUP")
+	var observedChecking atomic.Bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v2/auth/login", loginHandler(t, new(atomic.Int32)))
+	mux.HandleFunc("/api/v2/torrents/recheck", func(w http.ResponseWriter, r *http.Request) {
+		requireMutationRequest(t, r, "recheck", testHash)
+		state.Store("checkingUP")
+		_, _ = io.WriteString(w, "Ok.")
+	})
+	mux.HandleFunc("/api/v2/torrents/info", func(w http.ResponseWriter, r *http.Request) {
+		requireReadRequest(t, r, "sid-1", http.MethodGet)
+		if r.URL.Query().Get("filter") == "stopped" {
+			if state.Load().(string) == "stoppedUP" {
+				_, _ = io.WriteString(w, `[{"hash":"`+testHash+`","state":"stoppedUP"}]`)
+				return
+			}
+			_, _ = io.WriteString(w, `[]`)
+			return
+		}
+		current := state.Load().(string)
+		if current == "checkingUP" && observedChecking.CompareAndSwap(false, true) {
+			_, _ = io.WriteString(w, `[{"hash":"`+testHash+`","state":"checkingUP"}]`)
+			return
+		}
+		state.Store("stoppedUP")
+		_, _ = io.WriteString(w, `[{"hash":"`+testHash+`","state":"stoppedUP"}]`)
+	})
+	mux.HandleFunc("/api/v2/torrents/files", func(w http.ResponseWriter, r *http.Request) {
+		requireReadRequest(t, r, "sid-1", http.MethodGet)
+		_, _ = io.WriteString(w, `[{"index":0,"name":"selected.bin","size":4,"priority":1,"progress":0.5}]`)
+	})
+	client, _ := newTestClient(t, mux)
+
+	err := client.Recheck(context.Background(), testHash)
+	if err == nil || !strings.Contains(err.Error(), "selected file") {
+		t.Fatalf("Recheck() error = %v, want selected-file error", err)
+	}
+}
+
+func TestMutationRejectsNonExactHashesWithoutNetworkCalls(t *testing.T) {
+	var calls atomic.Int32
+	client, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		http.NotFound(w, r)
+	}))
+	for _, hash := range []string{"", "all", "|" + testHash, testHash + "|", "  " + testHash, strings.Repeat("g", 40), strings.Repeat("a", 41)} {
+		if err := client.Stop(context.Background(), hash); err == nil {
+			t.Errorf("Stop(%q) unexpectedly succeeded", hash)
+		}
+	}
+	if got := calls.Load(); got != 0 {
+		t.Errorf("invalid hashes caused %d HTTP calls, want zero", got)
+	}
+}
+
+func TestMutationRetriesExpiredSID(t *testing.T) {
+	var logins atomic.Int32
+	var stopCalls atomic.Int32
+	var state atomic.Value
+	state.Store("uploading")
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v2/auth/login", loginHandler(t, &logins))
+	mux.HandleFunc("/api/v2/torrents/stop", func(w http.ResponseWriter, r *http.Request) {
+		cookie, err := r.Cookie("SID")
+		if err != nil {
+			t.Errorf("stop missing SID: %v", err)
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		requireMutationRequest(t, r, "stop", testHash)
+		if stopCalls.Add(1) == 1 {
+			if cookie.Value != "sid-1" {
+				t.Errorf("first stop SID = %q, want sid-1", cookie.Value)
+			}
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		if cookie.Value != "sid-2" {
+			t.Errorf("retried stop SID = %q, want sid-2", cookie.Value)
+		}
+		state.Store("stoppedUP")
+		_, _ = io.WriteString(w, "Ok.")
+	})
+	mux.HandleFunc("/api/v2/torrents/info", func(w http.ResponseWriter, r *http.Request) {
+		requireReadRequest(t, r, "sid-2", http.MethodGet)
+		if r.URL.Query().Get("filter") != "stopped" {
+			t.Errorf("filter = %q, want stopped", r.URL.Query().Get("filter"))
+		}
+		if state.Load().(string) == "stoppedUP" {
+			_, _ = io.WriteString(w, `[{"hash":"`+testHash+`","state":"stoppedUP"}]`)
+			return
+		}
+		_, _ = io.WriteString(w, `[]`)
+	})
+	client, _ := newTestClient(t, mux)
+	if err := client.Stop(context.Background(), testHash); err != nil {
+		t.Fatalf("Stop() error: %v", err)
+	}
+	if got := logins.Load(); got != 2 {
+		t.Errorf("login calls = %d, want initial login and refresh", got)
+	}
+	if got := stopCalls.Load(); got != 2 {
+		t.Errorf("stop calls = %d, want original request and retry", got)
+	}
+}
+
+func TestRecheckRejectsHTTP200WithoutObservedCheck(t *testing.T) {
+	var state atomic.Value
+	state.Store("stoppedUP")
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v2/auth/login", loginHandler(t, new(atomic.Int32)))
+	mux.HandleFunc("/api/v2/torrents/recheck", func(w http.ResponseWriter, r *http.Request) {
+		requireMutationRequest(t, r, "recheck", testHash)
+		_, _ = io.WriteString(w, "Ok.")
+	})
+	mux.HandleFunc("/api/v2/torrents/info", func(w http.ResponseWriter, r *http.Request) {
+		requireReadRequest(t, r, "sid-1", http.MethodGet)
+		if r.URL.Query().Get("filter") == "stopped" {
+			_, _ = io.WriteString(w, `[{"hash":"`+testHash+`","state":"stoppedUP"}]`)
+			return
+		}
+		_, _ = io.WriteString(w, `[{"hash":"`+testHash+`","state":"`+state.Load().(string)+`"}]`)
+	})
+	mux.HandleFunc("/api/v2/torrents/files", func(w http.ResponseWriter, r *http.Request) {
+		requireReadRequest(t, r, "sid-1", http.MethodGet)
+		_, _ = io.WriteString(w, `[{"index":0,"name":"selected.bin","size":4,"priority":1,"progress":1}]`)
+	})
+	client, _ := newTestClient(t, mux)
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	err := client.Recheck(ctx, testHash)
+	if err == nil || !strings.Contains(err.Error(), "requested recheck to start") {
+		t.Fatalf("Recheck() error = %v, want operation-state timeout", err)
+	}
+}
+
+func TestStopRequiresConfirmedStoppedFilter(t *testing.T) {
+	var state atomic.Value
+	state.Store("uploading")
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v2/auth/login", loginHandler(t, new(atomic.Int32)))
+	mux.HandleFunc("/api/v2/torrents/stop", func(w http.ResponseWriter, r *http.Request) {
+		requireMutationRequest(t, r, "stop", testHash)
+		_, _ = io.WriteString(w, "Ok.")
+	})
+	mux.HandleFunc("/api/v2/torrents/info", func(w http.ResponseWriter, r *http.Request) {
+		requireReadRequest(t, r, "sid-1", http.MethodGet)
+		if r.URL.Query().Get("filter") == "stopped" {
+			_, _ = io.WriteString(w, `[]`)
+			return
+		}
+		_, _ = io.WriteString(w, `[{"hash":"`+testHash+`","state":"`+state.Load().(string)+`"}]`)
+	})
+	client, _ := newTestClient(t, mux)
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if err := client.Stop(ctx, testHash); err == nil || !strings.Contains(err.Error(), "last state \"uploading\"") {
+		t.Fatalf("Stop() error = %v, want timeout with last state", err)
+	}
+}
+
+func TestStopUsesStoppedFilterForMissingFilesState(t *testing.T) {
+	var state atomic.Value
+	state.Store("missingFiles")
+	var stopped atomic.Bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v2/auth/login", loginHandler(t, new(atomic.Int32)))
+	mux.HandleFunc("/api/v2/torrents/stop", func(w http.ResponseWriter, r *http.Request) {
+		requireMutationRequest(t, r, "stop", testHash)
+		stopped.Store(true)
+		_, _ = io.WriteString(w, "Ok.")
+	})
+	mux.HandleFunc("/api/v2/torrents/info", func(w http.ResponseWriter, r *http.Request) {
+		requireReadRequest(t, r, "sid-1", http.MethodGet)
+		if r.URL.Query().Get("hashes") != testHash {
+			t.Errorf("hashes = %q, want exact hash", r.URL.Query().Get("hashes"))
+		}
+		if r.URL.Query().Get("filter") == "stopped" {
+			if stopped.Load() {
+				_, _ = io.WriteString(w, `[{"hash":"`+testHash+`","state":"missingFiles"}]`)
+				return
+			}
+			_, _ = io.WriteString(w, `[]`)
+			return
+		}
+		_, _ = io.WriteString(w, `[{"hash":"`+testHash+`","state":"`+state.Load().(string)+`"}]`)
+	})
+	client, _ := newTestClient(t, mux)
+	if err := client.Stop(context.Background(), testHash); err != nil {
+		t.Fatalf("Stop() error for missingFiles torrent: %v", err)
+	}
+	if stopped, err := client.Stopped(context.Background(), testHash); err != nil || !stopped {
+		t.Fatalf("Stopped() = (%t, %v), want (true, nil)", stopped, err)
+	}
+}
+
+func requireMutationRequest(t *testing.T, r *http.Request, action, wantHash string) {
+	t.Helper()
+	if r.Method != http.MethodPost {
+		t.Errorf("%s method = %s, want POST", action, r.Method)
+	}
+	if r.URL.Path != "/api/v2/torrents/"+action {
+		t.Errorf("mutation path = %q, want %q", r.URL.Path, "/api/v2/torrents/"+action)
+	}
+	if r.URL.RawQuery != "" {
+		t.Errorf("mutation query = %q, want no query", r.URL.RawQuery)
+	}
+	if got, want := r.Header.Get("Content-Type"), "application/x-www-form-urlencoded"; got != want {
+		t.Errorf("mutation Content-Type = %q, want %q", got, want)
+	}
+	if got, want := r.Header.Get("Referer"), "http://"+r.Host; got != want {
+		t.Errorf("mutation Referer = %q, want %q", got, want)
+	}
+	if got, want := r.Header.Get("Origin"), "http://"+r.Host; got != want {
+		t.Errorf("mutation Origin = %q, want %q", got, want)
+	}
+	if _, err := r.Cookie("SID"); err != nil {
+		t.Errorf("mutation missing SID: %v", err)
+	}
+	if err := r.ParseForm(); err != nil {
+		t.Errorf("mutation ParseForm: %v", err)
+	}
+	if got := r.PostForm.Get("hashes"); got != wantHash {
+		t.Errorf("mutation hashes = %q, want exact hash %q", got, wantHash)
+	}
+	if got := len(r.PostForm["hashes"]); got != 1 {
+		t.Errorf("mutation hashes values = %d, want one", got)
 	}
 }
 
