@@ -86,10 +86,13 @@ type Torrent struct {
 	State        string  `json:"state"`
 	Progress     float64 `json:"progress"`
 	TotalSize    int64   `json:"total_size"`
+	Size         int64   `json:"size"`
+	AmountLeft   int64   `json:"amount_left"`
 	Uploaded     int64   `json:"uploaded"`
 	Ratio        float64 `json:"ratio"`
 	SeedingTime  int64   `json:"seeding_time"`
 	SavePath     string  `json:"save_path"`
+	ContentPath  string  `json:"content_path"`
 	CompletionOn int64   `json:"completion_on"`
 	AutoTMM      bool    `json:"auto_tmm"`
 }

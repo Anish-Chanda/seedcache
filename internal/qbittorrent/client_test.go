@@ -75,7 +75,7 @@ func TestReadMethodsDecodeDocumentedEndpoints(t *testing.T) {
 		if got := r.URL.Query().Get("hashes"); got != "" && got != testHash {
 			t.Errorf("torrents/info hashes = %q", got)
 		}
-		_, _ = io.WriteString(w, `[{"hash":"`+testHash+`","name":"Example","state":"uploading","progress":1,"total_size":4096,"uploaded":8192,"ratio":2,"seeding_time":3600,"save_path":"/data","completion_on":1700000000,"auto_tmm":true}]`)
+		_, _ = io.WriteString(w, `[{"hash":"`+testHash+`","name":"Example","state":"uploading","progress":1,"total_size":4096,"size":2048,"amount_left":0,"content_path":"/data/Example","uploaded":8192,"ratio":2,"seeding_time":3600,"save_path":"/data","completion_on":1700000000,"auto_tmm":true}]`)
 	})
 	mux.HandleFunc("/api/v2/torrents/properties", func(w http.ResponseWriter, r *http.Request) {
 		requireReadRequest(t, r, "sid-1", "GET")
@@ -168,7 +168,7 @@ func assertTorrent(t *testing.T, got Torrent) {
 	t.Helper()
 	if got.Hash != testHash || got.Name != "Example" || got.State != "uploading" || got.Progress != 1 ||
 		got.TotalSize != 4096 || got.Uploaded != 8192 || got.Ratio != 2 || got.SeedingTime != 3600 ||
-		got.SavePath != "/data" || got.CompletionOn != 1700000000 || !got.AutoTMM {
+		got.Size != 2048 || got.AmountLeft != 0 || got.ContentPath != "/data/Example" || got.SavePath != "/data" || got.CompletionOn != 1700000000 || !got.AutoTMM {
 		t.Errorf("Torrent = %#v", got)
 	}
 }
