@@ -12,6 +12,7 @@ import (
 	"github.com/anish-chanda/seedcache/internal/config"
 	"github.com/anish-chanda/seedcache/internal/logger"
 	"github.com/anish-chanda/seedcache/internal/qbittorrent"
+	"github.com/anish-chanda/seedcache/internal/replication"
 	"github.com/anish-chanda/seedcache/internal/store"
 )
 
@@ -39,6 +40,13 @@ func Run(ctx context.Context, path, version string) (result error) {
 	if err != nil {
 		return err
 	}
+	var engine *replication.Engine
+	if cfg.ReplicationEnabled() {
+		engine, err = replication.NewEngine(db, client, cfg.Source, cfg.Destination, log.With().Str("component", "replication").Logger())
+		if err != nil {
+			return fmt.Errorf("initialize replication: %w", err)
+		}
+	}
 	listener, err := net.Listen("tcp", cfg.API.Listen)
 	if err != nil {
 		return fmt.Errorf("listen API: %w", err)
@@ -46,8 +54,13 @@ func Run(ctx context.Context, path, version string) (result error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	discovery := newDiscovery(client, log.With().Str("component", "discovery").Logger())
+	discovery.engine = engine
+	var transfers []api.Transfers
+	if engine != nil {
+		transfers = append(transfers, engine)
+	}
 	server := &http.Server{
-		Handler:           api.New(discovery, version, log.With().Str("component", "api").Logger()),
+		Handler:           api.New(discovery, version, log.With().Str("component", "api").Logger(), transfers...),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      40 * time.Second,
@@ -60,10 +73,22 @@ func Run(ctx context.Context, path, version string) (result error) {
 		discovery.run(ctx, cfg.Discovery.Interval)
 	}()
 	served := make(chan error, 1)
+	replicationDone := make(chan struct{})
+	replicationErrors := make(chan error, 1)
+	go func() {
+		defer close(replicationDone)
+		if engine != nil {
+			if err := engine.Run(ctx); err != nil {
+				replicationErrors <- err
+			}
+		}
+	}()
 	go func() { served <- server.Serve(listener) }()
 	log.Info().Str("address", listener.Addr().String()).Str("version", version).Msg("SeedCache started")
 	select {
 	case <-ctx.Done():
+	case err := <-replicationErrors:
+		result = fmt.Errorf("replication worker: %w", err)
 	case err := <-served:
 		if !errors.Is(err, http.ErrServerClosed) {
 			result = fmt.Errorf("serve API: %w", err)
@@ -79,6 +104,7 @@ func Run(ctx context.Context, path, version string) (result error) {
 		}
 	}
 	<-done
+	<-replicationDone
 	log.Info().Msg("SeedCache stopped")
 	return result
 }

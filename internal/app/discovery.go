@@ -9,6 +9,7 @@ import (
 
 	"github.com/anish-chanda/seedcache/internal/api"
 	"github.com/anish-chanda/seedcache/internal/qbittorrent"
+	"github.com/anish-chanda/seedcache/internal/replication"
 	"github.com/rs/zerolog"
 )
 
@@ -18,6 +19,7 @@ type discovery struct {
 	mu       sync.RWMutex
 	status   api.Status
 	torrents []api.Torrent
+	engine   *replication.Engine
 }
 
 func newDiscovery(client *qbittorrent.Client, log zerolog.Logger) *discovery {
@@ -95,9 +97,17 @@ func (d *discovery) poll(ctx context.Context) {
 		d.log.Info().Str("version", version).Msg("qBittorrent connected")
 	}
 	d.log.Debug().Int("torrents", len(snapshot)).Msg("Discovery refreshed")
+	if d.engine != nil {
+		if err := d.engine.Reconcile(ctx, torrents); err != nil && ctx.Err() == nil {
+			d.log.Error().Err(err).Msg("Reconcile replications failed")
+		}
+	}
 }
 
 func (d *discovery) disconnected(err error) {
+	if d.engine != nil {
+		d.engine.Unavailable()
+	}
 	d.mu.Lock()
 	previous := d.status.QBittorrent.Error
 	connected := d.status.QBittorrent.Connected
