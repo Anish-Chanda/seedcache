@@ -1,0 +1,13 @@
+# Local configuration may contain qBittorrent credentials.
+config.yaml
+.env
+
+# Local build artifacts and SQLite databases.
+bin/
+dist/
+coverage.out
+*.db
+*.db-shm
+*.db-wal
+
+/seedcache
