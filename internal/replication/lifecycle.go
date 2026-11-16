@@ -559,12 +559,17 @@ func manifestFromTorrentMetadata(torrent qbittorrent.Torrent, files []qbittorren
 		return Manifest{}, &BlockedError{Reason: "qBittorrent content_path is outside the configured source root"}
 	}
 	manifest := Manifest{Files: make([]File, 0, len(files))}
+	allFilesSize := int64(0)
 	seenIndexes := make(map[int]struct{}, len(files))
 	seenPaths := make(map[string]struct{}, len(files))
 	for _, file := range files {
 		if file.Priority < 0 || file.Size < 0 || file.Index < 0 || !isFinite(file.Progress) || file.Progress < 0 || file.Progress > 1 {
 			return Manifest{}, &BlockedError{Reason: fmt.Sprintf("qBittorrent returned invalid file metadata for %q", file.Name)}
 		}
+		if file.Size > math.MaxInt64-allFilesSize {
+			return Manifest{}, &BlockedError{Reason: "torrent files exceed the supported total size"}
+		}
+		allFilesSize += file.Size
 		if _, exists := seenIndexes[file.Index]; exists {
 			return Manifest{}, &BlockedError{Reason: fmt.Sprintf("qBittorrent returned duplicate file index %d", file.Index)}
 		}
@@ -603,7 +608,13 @@ func manifestFromTorrentMetadata(torrent qbittorrent.Torrent, files []qbittorren
 		return Manifest{}, &BlockedError{Reason: "torrent has no selected files"}
 	}
 	if torrent.Size > 0 && torrent.Size != manifest.TotalSize {
-		return Manifest{}, &BlockedError{Reason: "qBittorrent selected size does not match its file list"}
+		// A migrated missingFiles torrent can report the full torrent size
+		// even when qBittorrent marks some files as skipped. Accept only
+		// when the full size is independently corroborated by every file.
+		if torrent.Size != torrent.TotalSize || torrent.TotalSize != allFilesSize ||
+			manifest.TotalSize >= allFilesSize {
+			return Manifest{}, &BlockedError{Reason: "qBittorrent selected size does not match its file list"}
+		}
 	}
 	sort.Slice(manifest.Files, func(i, j int) bool {
 		if manifest.Files[i].Path != manifest.Files[j].Path {

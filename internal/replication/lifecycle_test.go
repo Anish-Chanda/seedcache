@@ -120,6 +120,57 @@ func TestManifestFromTorrentMetadataSupportsMissingEvictedPayload(t *testing.T) 
 	}
 }
 
+func TestManifestFromTorrentMetadataAcceptsFullSizeWithSkippedFiles(t *testing.T) {
+	root := t.TempDir()
+	source := config.SourceConfig{QBittorrentBasePath: "/downloads", LocalBasePath: root}
+	files := []qbittorrent.File{
+		{Index: 0, Name: "show/episode.mkv", Size: 100, Priority: 1, Progress: 0},
+		{Index: 1, Name: "show/description.nfo", Size: 31, Priority: 0, Progress: 0},
+	}
+	torrent := qbittorrent.Torrent{
+		State: "missingFiles", Size: 131, TotalSize: 131,
+		SavePath: "/downloads", ContentPath: "/downloads/show",
+	}
+	manifest, err := manifestFromTorrentMetadata(torrent, files, source)
+	if err != nil {
+		t.Fatalf("manifestFromTorrentMetadata() error = %v", err)
+	}
+	want := Manifest{Files: []File{{Path: "show/episode.mkv", Size: 100, Index: 0}}, TotalSize: 100}
+	if !manifest.Equal(want) {
+		t.Fatalf("manifest = %+v, want %+v", manifest, want)
+	}
+}
+
+func TestManifestFromTorrentMetadataRejectsUnexplainedSizeMismatch(t *testing.T) {
+	root := t.TempDir()
+	source := config.SourceConfig{QBittorrentBasePath: "/downloads", LocalBasePath: root}
+	files := []qbittorrent.File{
+		{Index: 0, Name: "show/episode.mkv", Size: 100, Priority: 1},
+		{Index: 1, Name: "show/description.nfo", Size: 31, Priority: 0},
+	}
+	tests := []struct {
+		name      string
+		size      int64
+		totalSize int64
+	}{
+		{name: "unexpected selected size", size: 130, totalSize: 131},
+		{name: "inconsistent full size", size: 132, totalSize: 132},
+		{name: "size not equal full size", size: 132, totalSize: 131},
+		{name: "missing total size", size: 131, totalSize: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			torrent := qbittorrent.Torrent{
+				State: "missingFiles", Size: tt.size, TotalSize: tt.totalSize,
+				SavePath: "/downloads", ContentPath: "/downloads/show",
+			}
+			if _, err := manifestFromTorrentMetadata(torrent, files, source); !isBlocked(err) {
+				t.Fatalf("error = %v, want blocked", err)
+			}
+		})
+	}
+}
+
 func TestCheckNoSharedPayloadIncludesIncompleteUnselectedFiles(t *testing.T) {
 	payload := strings.Repeat("x", 128)
 	candidate := singleFileTorrent("hash-a", "shared.bin", payload)
