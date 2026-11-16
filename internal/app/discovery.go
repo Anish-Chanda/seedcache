@@ -157,6 +157,7 @@ func mapTorrent(t qbittorrent.Torrent) api.Torrent {
 		SeedingSeconds: t.SeedingTime,
 		SavePath:       t.SavePath,
 		AutoTMM:        t.AutoTMM,
+		CacheState:     "present",
 	}
 	if t.CompletionOn > 0 {
 		completed := time.Unix(t.CompletionOn, 0).UTC()

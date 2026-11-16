@@ -46,6 +46,7 @@ func Run(ctx context.Context, path, version string) (result error) {
 		if err != nil {
 			return fmt.Errorf("initialize replication: %w", err)
 		}
+		engine.ConfigureRetention(cfg.Retention)
 	}
 	listener, err := net.Listen("tcp", cfg.API.Listen)
 	if err != nil {

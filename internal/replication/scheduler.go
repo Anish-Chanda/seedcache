@@ -23,6 +23,9 @@ const (
 type runner interface {
 	Transfer(context.Context, Manifest) error
 	Verify(context.Context, Manifest) error
+	DestinationAvailable(context.Context, Manifest) error
+	Restore(context.Context, Manifest) error
+	VerifyRestored(context.Context, Manifest) error
 }
 
 type Engine struct {
@@ -33,12 +36,20 @@ type Engine struct {
 	runner      runner
 	log         zerolog.Logger
 	wake        chan struct{}
+	retention   config.RetentionConfig
 
-	mu           sync.Mutex
-	connected    bool
-	snapshot     map[string]qbittorrent.Torrent
-	activeHash   string
-	activeCancel context.CancelFunc
+	mu                       sync.Mutex
+	cacheGuardMu             sync.Mutex
+	connected                bool
+	snapshot                 map[string]qbittorrent.Torrent
+	activeHash               string
+	activeCancel             context.CancelFunc
+	activeCacheHash          string
+	activeCacheOperation     CacheOperation
+	activeCacheChecking      bool
+	retentionActive          bool
+	retentionPressureLogged  bool
+	retentionExhaustedLogged bool
 }
 
 func NewEngine(db *sql.DB, client *qbittorrent.Client, source config.SourceConfig, destination config.DestinationConfig, log zerolog.Logger) (*Engine, error) {
@@ -88,6 +99,16 @@ func (e *Engine) Summary(ctx context.Context) (Summary, error) {
 	return summary, nil
 }
 
+func (e *Engine) ConfigureRetention(retention config.RetentionConfig) {
+	e.mu.Lock()
+	e.retention = retention
+	e.retentionActive = false
+	e.retentionPressureLogged = false
+	e.retentionExhaustedLogged = false
+	e.mu.Unlock()
+	e.signal()
+}
+
 // Queue captures torrent metadata and stores a pending record. Transfers are
 // started only by Run, outside the caller's request.
 func (e *Engine) Queue(ctx context.Context, hash string) (Record, error) {
@@ -97,6 +118,9 @@ func (e *Engine) Queue(ctx context.Context, hash string) (Record, error) {
 	}
 	current, err := e.repository.get(ctx, normalized)
 	if err == nil {
+		if current.CacheState != CachePresent || current.CacheOperation != "" {
+			return current, fmt.Errorf("%w: torrent cache lifecycle is %s", ErrConflict, cacheDescription(current))
+		}
 		switch current.State {
 		case StatePending, StateTransferring, StateVerifying:
 			return current, nil
@@ -153,6 +177,9 @@ func (e *Engine) Retry(ctx context.Context, hash string) (Record, error) {
 	}
 	if current.State != StateFailed && current.State != StateBlocked {
 		return current, fmt.Errorf("%w: only failed or blocked replications can be retried", ErrConflict)
+	}
+	if current.CacheState != CachePresent || current.CacheOperation != "" {
+		return current, fmt.Errorf("%w: torrent cache lifecycle is %s", ErrConflict, cacheDescription(current))
 	}
 	torrent, manifest, err := e.fetchManifest(ctx, normalized)
 	if err != nil {
@@ -213,6 +240,7 @@ func (e *Engine) Reconcile(ctx context.Context, torrents []qbittorrent.Torrent) 
 	activeHash := e.activeHash
 	e.mu.Unlock()
 	e.signal()
+	e.reconcileEvictedTorrents(ctx, torrents)
 
 	if activeHash != "" {
 		if err := e.reconcileActive(ctx, activeHash, snapshot); err != nil {
@@ -229,7 +257,7 @@ func (e *Engine) Reconcile(ctx context.Context, torrents []qbittorrent.Torrent) 
 		}
 		current, err := e.repository.get(ctx, hash)
 		if err == nil {
-			if current.State == StateReplicated && e.identityMismatch(current) {
+			if current.State == StateReplicated && current.CacheState == CachePresent && current.CacheOperation == "" && e.identityMismatch(current) {
 				if _, blockErr := e.blockReconfigured(current); blockErr != nil {
 					return blockErr
 				}
@@ -285,6 +313,9 @@ func (e *Engine) Unavailable() {
 func (e *Engine) Run(ctx context.Context) error {
 	persistCtx, cancel := persistenceContext()
 	err := e.repository.recoverInterrupted(persistCtx, time.Now().UTC())
+	if err == nil {
+		err = e.repository.recoverCacheOperations(persistCtx, time.Now().UTC())
+	}
 	cancel()
 	if err != nil {
 		return err
@@ -300,12 +331,37 @@ func (e *Engine) Run(ctx context.Context) error {
 		e.mu.Unlock()
 		if connected {
 			dbCtx, cancel := persistenceContext()
+			operation, found, err := e.repository.nextCacheOperation(dbCtx)
+			cancel()
+			if err != nil {
+				return err
+			}
+			if found {
+				if err := e.runCacheOperation(ctx, operation); err != nil {
+					return err
+				}
+				continue
+			}
+			queued, err := e.queueAutomaticEviction(ctx)
+			if err != nil {
+				e.log.Warn().Err(err).Msg("automatic eviction planning failed")
+				if !e.isConnected() {
+					continue
+				}
+			}
+			if queued {
+				continue
+			}
+			dbCtx, cancel = persistenceContext()
 			record, found, err := e.repository.nextReady(dbCtx, time.Now().UTC())
 			cancel()
 			if err != nil {
 				return err
 			}
 			if found {
+				if record.CacheState != CachePresent || record.CacheOperation != "" {
+					continue
+				}
 				dbCtx, cancel = persistenceContext()
 				started, ok, err := e.repository.start(dbCtx, record.Hash, time.Now().UTC())
 				cancel()
@@ -709,6 +765,8 @@ func (e *Engine) newRecord(hash string, state State, manifest Manifest) Record {
 		DestinationIdentity: e.destinationIdentity(),
 		CreatedAt:           now,
 		UpdatedAt:           now,
+		CacheState:          CachePresent,
+		CacheUpdatedAt:      now,
 	}
 }
 

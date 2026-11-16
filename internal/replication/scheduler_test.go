@@ -308,10 +308,21 @@ func (e *schedulerTestEnv) handleQBittorrent(w http.ResponseWriter, r *http.Requ
 	case "/api/v2/torrents/info":
 		e.mu.Lock()
 		unavailable := e.unavailable
-		item, ok := e.torrents[strings.ToLower(r.URL.Query().Get("hashes"))]
+		hash := strings.ToLower(r.URL.Query().Get("hashes"))
+		item, ok := e.torrents[hash]
+		all := make([]qbittorrent.Torrent, 0, len(e.torrents))
+		if hash == "" {
+			for _, candidate := range e.torrents {
+				all = append(all, candidate.torrent)
+			}
+		}
 		e.mu.Unlock()
 		if unavailable {
 			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if hash == "" {
+			writeTestJSON(w, all)
 			return
 		}
 		if !ok {
@@ -398,6 +409,12 @@ func (r *fakeRunner) Transfer(ctx context.Context, manifest Manifest) error {
 }
 
 func (r *fakeRunner) Verify(context.Context, Manifest) error { return nil }
+
+func (r *fakeRunner) DestinationAvailable(context.Context, Manifest) error { return nil }
+
+func (r *fakeRunner) Restore(context.Context, Manifest) error { return nil }
+
+func (r *fakeRunner) VerifyRestored(context.Context, Manifest) error { return nil }
 
 func (r *fakeRunner) waitStarted(t *testing.T) {
 	t.Helper()
