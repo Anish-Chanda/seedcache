@@ -519,7 +519,7 @@ func (c *Client) postTorrentAction(ctx context.Context, action, hash string) err
 	if response.StatusCode == http.StatusNotFound {
 		return fmt.Errorf("%w: torrents/%s", ErrNotFound, action)
 	}
-	if response.StatusCode != http.StatusOK {
+	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusNoContent {
 		return &HTTPError{Operation: "torrents/" + action, StatusCode: response.StatusCode}
 	}
 	if _, err := io.Copy(io.Discard, io.LimitReader(response.Body, 1<<20)); err != nil {
@@ -777,7 +777,7 @@ func (c *Client) login(ctx context.Context) error {
 		return requestFailure("auth/login", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
 		return &HTTPError{Operation: "auth/login", StatusCode: resp.StatusCode}
 	}
 	// Drain the small response for connection reuse without retaining or
@@ -786,7 +786,7 @@ func (c *Client) login(ctx context.Context) error {
 		return fmt.Errorf("qBittorrent auth/login response could not be read: %w", err)
 	}
 	for _, cookie := range resp.Cookies() {
-		if cookie.Name == "SID" && cookie.Value != "" {
+		if (cookie.Name == "SID" || strings.HasPrefix(cookie.Name, "QBT_SID_")) && cookie.Value != "" {
 			return nil
 		}
 	}

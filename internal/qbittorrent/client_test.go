@@ -58,6 +58,59 @@ func loginHandler(t *testing.T, calls *atomic.Int32) http.HandlerFunc {
 	}
 }
 
+func TestLoginAcceptsHTTP204AndQBTSessionCookie(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v2/auth/login", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("login method = %s, want POST", r.Method)
+		}
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("login parse form: %v", err)
+		}
+		if r.Form.Get("username") != "test-user" || r.Form.Get("password") != "test-password" {
+			t.Error("login credentials mismatch")
+		}
+		http.SetCookie(w, &http.Cookie{Name: "QBT_SID_8080", Value: "session", Path: "/"})
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/api/v2/torrents/info", func(w http.ResponseWriter, r *http.Request) {
+		cookie, err := r.Cookie("QBT_SID_8080")
+		if err != nil || cookie.Value != "session" {
+			t.Errorf("expected port-named session cookie, got %v: %v", cookie, err)
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		_, _ = io.WriteString(w, "[]")
+	})
+	client, _ := newTestClient(t, mux)
+	if _, err := client.Torrents(context.Background()); err != nil {
+		t.Fatalf("Torrents() after 204 login: %v", err)
+	}
+}
+
+func TestStopAcceptsHTTP204(t *testing.T) {
+	var stopped atomic.Bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v2/auth/login", loginHandler(t, new(atomic.Int32)))
+	mux.HandleFunc("/api/v2/torrents/stop", func(w http.ResponseWriter, r *http.Request) {
+		requireMutationRequest(t, r, "stop", testHash)
+		stopped.Store(true)
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/api/v2/torrents/info", func(w http.ResponseWriter, r *http.Request) {
+		requireReadRequest(t, r, "sid-1", http.MethodGet)
+		if r.URL.Query().Get("filter") == "stopped" && stopped.Load() {
+			_, _ = io.WriteString(w, `[{"hash":"`+testHash+`","state":"stoppedUP"}]`)
+			return
+		}
+		_, _ = io.WriteString(w, "[]")
+	})
+	client, _ := newTestClient(t, mux)
+	if err := client.Stop(context.Background(), testHash); err != nil {
+		t.Fatalf("Stop() with HTTP 204: %v", err)
+	}
+}
+
 func TestReadMethodsDecodeDocumentedEndpoints(t *testing.T) {
 	var logins atomic.Int32
 	mux := http.NewServeMux()
