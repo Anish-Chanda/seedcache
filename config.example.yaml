@@ -1,0 +1,19 @@
+qbittorrent:
+  # This URL must be reachable from the Seedcache process/container.
+  url: http://host.docker.internal:8080
+  # Set both here, or export QBITTORRENT_USERNAME and QBITTORRENT_PASSWORD.
+  # For secret files, use QBITTORRENT_USERNAME_FILE/PASSWORD_FILE instead.
+  # username: your-qbittorrent-username
+  # password: your-qbittorrent-password
+
+api:
+  listen: 0.0.0.0:8765
+
+database:
+  path: /var/lib/seedcache/seedcache.db
+
+discovery:
+  interval: 30s
+
+logging:
+  level: info
