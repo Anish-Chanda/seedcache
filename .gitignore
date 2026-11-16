@@ -1,6 +1,8 @@
 # Local configuration may contain qBittorrent credentials.
 config.yaml
 .env
+/ssh/
+/downloads/
 
 # Local build artifacts and SQLite databases.
 bin/

@@ -15,5 +15,13 @@ database:
 discovery:
   interval: 30s
 
+source:
+  qbittorrent_base_path: /downloads
+  local_base_path: /data/torrents
+
+destination:
+  ssh_target: blr
+  base_path: /mnt/storage/torrents
+
 logging:
   level: info

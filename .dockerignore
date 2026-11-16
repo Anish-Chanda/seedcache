@@ -1,6 +1,8 @@
 .git
 .gitignore
 .env
+/ssh/
+/downloads/
 config.yaml
 *.db
 *.db-shm

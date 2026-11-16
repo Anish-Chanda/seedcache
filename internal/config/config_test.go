@@ -199,3 +199,34 @@ func writeConfig(t *testing.T, contents string) string {
 	}
 	return path
 }
+
+func TestReplicationConfiguration(t *testing.T) {
+	base := "qbittorrent:\n  url: http://localhost:8080\n  username: user\n  password: pass\n"
+	valid := "source:\n  qbittorrent_base_path: /downloads\n  local_base_path: /data/torrents\ndestination:\n  ssh_target: storage\n  base_path: /mnt/storage/torrents\n"
+	for _, tt := range []struct {
+		name      string
+		extra     string
+		wantError bool
+		enabled   bool
+	}{
+		{"discovery only", "", false, false},
+		{"complete", valid, false, true},
+		{"user alias", strings.Replace(valid, "ssh_target: storage", "ssh_target: user@storage", 1), false, true},
+		{"partial", "source:\n  local_base_path: /data/torrents\n", true, false},
+		{"relative source", strings.Replace(valid, "/downloads", "downloads", 1), true, false},
+		{"traversal", strings.Replace(valid, "/downloads", "/downloads/../etc", 1), true, false},
+		{"root", strings.Replace(valid, "/mnt/storage/torrents", "/", 1), true, false},
+		{"ssh options", strings.Replace(valid, "ssh_target: storage", "ssh_target: '-oProxyCommand=bad'", 1), true, false},
+		{"remote path syntax", strings.Replace(valid, "ssh_target: storage", "ssh_target: 'host:/tmp'", 1), true, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := Load(writeConfig(t, base+tt.extra))
+			if (err != nil) != tt.wantError {
+				t.Fatalf("Load error = %v, want error %v", err, tt.wantError)
+			}
+			if err == nil && cfg.ReplicationEnabled() != tt.enabled {
+				t.Fatalf("enabled = %v", cfg.ReplicationEnabled())
+			}
+		})
+	}
+}

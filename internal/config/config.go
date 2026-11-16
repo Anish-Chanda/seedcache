@@ -6,6 +6,9 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +22,22 @@ type Config struct {
 	Database    DatabaseConfig    `yaml:"database"`
 	Discovery   DiscoveryConfig   `yaml:"discovery"`
 	Logging     LoggingConfig     `yaml:"logging"`
+	Source      SourceConfig      `yaml:"source"`
+	Destination DestinationConfig `yaml:"destination"`
+}
+
+type SourceConfig struct {
+	QBittorrentBasePath string `yaml:"qbittorrent_base_path"`
+	LocalBasePath       string `yaml:"local_base_path"`
+}
+
+type DestinationConfig struct {
+	SSHTarget string `yaml:"ssh_target"`
+	BasePath  string `yaml:"base_path"`
+}
+
+func (c Config) ReplicationEnabled() bool {
+	return c.Source.QBittorrentBasePath != "" && c.Source.LocalBasePath != "" && c.Destination.SSHTarget != "" && c.Destination.BasePath != ""
 }
 
 type QBittorrentConfig struct {
@@ -148,10 +167,38 @@ func validate(cfg Config) error {
 	if cfg.Discovery.Interval <= 0 {
 		return fmt.Errorf("discovery.interval must be greater than zero")
 	}
+	if err := validateReplication(cfg); err != nil {
+		return err
+	}
 	switch cfg.Logging.Level {
 	case "trace", "debug", "info", "warn", "error":
 	default:
 		return fmt.Errorf("logging.level must be one of trace, debug, info, warn, or error")
+	}
+	return nil
+}
+
+func validateReplication(cfg Config) error {
+	if cfg.Source == (SourceConfig{}) && cfg.Destination == (DestinationConfig{}) {
+		return nil
+	}
+	if !cfg.ReplicationEnabled() {
+		return fmt.Errorf("replication requires source.qbittorrent_base_path, source.local_base_path, destination.ssh_target, and destination.base_path")
+	}
+	for key, value := range map[string]string{
+		"source.qbittorrent_base_path": cfg.Source.QBittorrentBasePath,
+		"destination.base_path":        cfg.Destination.BasePath,
+	} {
+		if !path.IsAbs(value) || path.Clean(value) != value || value == "/" || strings.ContainsRune(value, 0) {
+			return fmt.Errorf("%s must be a clean absolute directory path other than /", key)
+		}
+	}
+	local := cfg.Source.LocalBasePath
+	if !filepath.IsAbs(local) || filepath.Clean(local) != local || local == string(filepath.Separator) || strings.ContainsRune(local, 0) {
+		return fmt.Errorf("source.local_base_path must be a clean absolute directory path other than /")
+	}
+	if !regexp.MustCompile(`^([a-zA-Z0-9_][a-zA-Z0-9_.-]*@)?[a-zA-Z0-9_][a-zA-Z0-9_.-]*$`).MatchString(cfg.Destination.SSHTarget) {
+		return fmt.Errorf("destination.ssh_target must be an SSH host alias or [user@]hostname; configure ports and other options in SSH config")
 	}
 	return nil
 }

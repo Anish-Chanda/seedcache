@@ -10,6 +10,9 @@ services:
     volumes:
       - "./config.yaml:/etc/seedcache/config.yaml:ro"
       - "seedcache-data:/var/lib/seedcache"
+      - "${SEEDCACHE_SOURCE_PATH:-./downloads}:/data/torrents:ro"
+      # Own SSH files as the container's seedcache user; config and keys need mode 600.
+      - "${SEEDCACHE_SSH_PATH:-./ssh}:/var/lib/seedcache/.ssh:ro"
     # Pass through credential variables set in the host shell. When absent,
     # they stay unset and the config file values remain in effect.
     environment:
