@@ -23,5 +23,12 @@ destination:
   ssh_target: blr
   base_path: /mnt/storage/torrents
 
+retention:
+  auto_evict: false
+  min_ratio: 1.0
+  min_seeding_time: 72h
+  low_free_percent: 10
+  target_free_percent: 20
+
 logging:
   level: info

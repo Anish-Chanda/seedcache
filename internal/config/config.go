@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -24,6 +25,15 @@ type Config struct {
 	Logging     LoggingConfig     `yaml:"logging"`
 	Source      SourceConfig      `yaml:"source"`
 	Destination DestinationConfig `yaml:"destination"`
+	Retention   RetentionConfig   `yaml:"retention"`
+}
+
+type RetentionConfig struct {
+	AutoEvict         bool          `yaml:"auto_evict"`
+	MinRatio          float64       `yaml:"min_ratio"`
+	MinSeedingTime    time.Duration `yaml:"min_seeding_time"`
+	LowFreePercent    float64       `yaml:"low_free_percent"`
+	TargetFreePercent float64       `yaml:"target_free_percent"`
 }
 
 type SourceConfig struct {
@@ -72,6 +82,7 @@ func Load(path string) (Config, error) {
 		Database:  DatabaseConfig{Path: "/var/lib/seedcache/seedcache.db"},
 		Discovery: DiscoveryConfig{Interval: 30 * time.Second},
 		Logging:   LoggingConfig{Level: "info"},
+		Retention: RetentionConfig{MinRatio: 1, MinSeedingTime: 72 * time.Hour, LowFreePercent: 10, TargetFreePercent: 20},
 	}
 
 	data, err := os.ReadFile(path)
@@ -169,6 +180,16 @@ func validate(cfg Config) error {
 	}
 	if err := validateReplication(cfg); err != nil {
 		return err
+	}
+	policy := cfg.Retention
+	if math.IsNaN(policy.MinRatio) || math.IsInf(policy.MinRatio, 0) || policy.MinRatio < 0 || policy.MinSeedingTime < 0 {
+		return fmt.Errorf("retention minimum ratio and seeding time must be finite and nonnegative")
+	}
+	if math.IsNaN(policy.LowFreePercent) || math.IsInf(policy.LowFreePercent, 0) || math.IsNaN(policy.TargetFreePercent) || math.IsInf(policy.TargetFreePercent, 0) || policy.LowFreePercent < 0 || policy.LowFreePercent >= policy.TargetFreePercent || policy.TargetFreePercent > 100 {
+		return fmt.Errorf("retention free-space percentages require 0 <= low_free_percent < target_free_percent <= 100")
+	}
+	if policy.AutoEvict && !cfg.ReplicationEnabled() {
+		return fmt.Errorf("retention.auto_evict requires replication to be configured")
 	}
 	switch cfg.Logging.Level {
 	case "trace", "debug", "info", "warn", "error":

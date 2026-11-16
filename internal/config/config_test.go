@@ -230,3 +230,30 @@ func TestReplicationConfiguration(t *testing.T) {
 		})
 	}
 }
+
+func TestRetentionConfiguration(t *testing.T) {
+	base := "qbittorrent:\n  url: http://localhost:8080\n  username: user\n  password: pass\n"
+	cfg, err := Load(writeConfig(t, base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Retention.AutoEvict || cfg.Retention.MinRatio != 1 || cfg.Retention.MinSeedingTime != 72*time.Hour || cfg.Retention.LowFreePercent != 10 || cfg.Retention.TargetFreePercent != 20 {
+		t.Fatalf("unexpected retention defaults: %+v", cfg.Retention)
+	}
+	for _, extra := range []string{
+		"  min_ratio: -1\n", "  min_ratio: .nan\n", "  min_ratio: .inf\n",
+		"  min_seeding_time: -1h\n", "  low_free_percent: -1\n", "  low_free_percent: 20\n",
+		"  target_free_percent: 10\n", "  target_free_percent: 101\n", "  target_free_percent: .nan\n",
+		"  auto_evict: true\n",
+	} {
+		t.Run(strings.TrimSpace(extra), func(t *testing.T) {
+			if _, err := Load(writeConfig(t, base+"retention:\n"+extra)); err == nil {
+				t.Fatal("accepted invalid retention configuration")
+			}
+		})
+	}
+	cfg, err = Load(writeConfig(t, base+"source:\n  qbittorrent_base_path: /downloads\n  local_base_path: /data/torrents\ndestination:\n  ssh_target: storage\n  base_path: /torrents\nretention:\n  auto_evict: true\n  min_ratio: 0\n  min_seeding_time: 0s\n  low_free_percent: 0\n  target_free_percent: 100\n"))
+	if err != nil || !cfg.Retention.AutoEvict {
+		t.Fatalf("valid configured retention: %+v, %v", cfg.Retention, err)
+	}
+}
