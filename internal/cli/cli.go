@@ -15,6 +15,7 @@ import (
 
 	"github.com/anish-chanda/seedcache/internal/api"
 	"github.com/anish-chanda/seedcache/internal/config"
+	"github.com/anish-chanda/seedcache/internal/replication"
 	"github.com/dustin/go-humanize"
 	"github.com/spf13/cobra"
 )
@@ -44,6 +45,9 @@ func New(version string, runDaemon func(context.Context, string) error) *cobra.C
 	root.AddCommand(newDaemonCommand(opts, runDaemon))
 	root.AddCommand(newStatusCommand(opts))
 	root.AddCommand(newTorrentsCommand(opts))
+	root.AddCommand(newTransfersCommand(opts))
+	root.AddCommand(newSyncCommand(opts))
+	root.AddCommand(newRetryCommand(opts))
 	root.AddCommand(newVersionCommand(version, opts))
 	root.AddCommand(newConfigCommand(opts))
 	return root
@@ -106,6 +110,92 @@ func newTorrentsCommand(opts *options) *cobra.Command {
 	}
 	command.AddCommand(newTorrentShowCommand(opts))
 	return command
+}
+
+func newTransfersCommand(opts *options) *cobra.Command {
+	command := &cobra.Command{
+		Use:   "transfers",
+		Short: "List replication transfers",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			var result api.TransferList
+			if err := newAPIClient(opts.server).get(cmd.Context(), "/api/v1/transfers", &result); err != nil {
+				return err
+			}
+			if opts.jsonOutput {
+				return writeJSON(cmd.OutOrStdout(), result)
+			}
+			return writeTransfers(cmd.OutOrStdout(), result.Transfers)
+		},
+	}
+	command.AddCommand(newTransferShowCommand(opts))
+	return command
+}
+
+func newTransferShowCommand(opts *options) *cobra.Command {
+	return &cobra.Command{
+		Use:   "show <hash>",
+		Short: "Show replication transfer details",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			hash, err := transferHash(args[0])
+			if err != nil {
+				return err
+			}
+			var record replication.Record
+			path := "/api/v1/transfers/" + url.PathEscape(hash)
+			if err := newAPIClient(opts.server).get(cmd.Context(), path, &record); err != nil {
+				return err
+			}
+			if opts.jsonOutput {
+				return writeJSON(cmd.OutOrStdout(), record)
+			}
+			return writeTransferDetail(cmd.OutOrStdout(), record)
+		},
+	}
+}
+
+func newSyncCommand(opts *options) *cobra.Command {
+	return newTransferActionCommand(opts, "sync", "Queue replication for a torrent", func(hash string) string {
+		return "/api/v1/torrents/" + url.PathEscape(hash) + "/sync"
+	})
+}
+
+func newRetryCommand(opts *options) *cobra.Command {
+	return newTransferActionCommand(opts, "retry", "Retry a failed or blocked transfer", func(hash string) string {
+		return "/api/v1/transfers/" + url.PathEscape(hash) + "/retry"
+	})
+}
+
+func newTransferActionCommand(opts *options, name, short string, endpoint func(string) string) *cobra.Command {
+	return &cobra.Command{
+		Use:   name + " <hash>",
+		Short: short,
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			hash, err := transferHash(args[0])
+			if err != nil {
+				return err
+			}
+			var record replication.Record
+			if err := newAPIClient(opts.server).post(cmd.Context(), endpoint(hash), &record); err != nil {
+				return err
+			}
+			if opts.jsonOutput {
+				return writeJSON(cmd.OutOrStdout(), record)
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "Transfer %s: %s\n", cleanCell(record.Hash), record.State)
+			return err
+		},
+	}
+}
+
+func transferHash(value string) (string, error) {
+	hash := strings.TrimSpace(value)
+	if hash == "" {
+		return "", errors.New("torrent hash must not be empty")
+	}
+	return hash, nil
 }
 
 func newTorrentShowCommand(opts *options) *cobra.Command {
@@ -185,11 +275,19 @@ func newAPIClient(baseURL string) *apiClient {
 }
 
 func (c *apiClient) get(ctx context.Context, endpoint string, target any) error {
+	return c.request(ctx, http.MethodGet, endpoint, target)
+}
+
+func (c *apiClient) post(ctx context.Context, endpoint string, target any) error {
+	return c.request(ctx, http.MethodPost, endpoint, target)
+}
+
+func (c *apiClient) request(ctx context.Context, method, endpoint string, target any) error {
 	requestURL, err := c.endpoint(endpoint)
 	if err != nil {
 		return err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
+	request, err := http.NewRequestWithContext(ctx, method, requestURL, nil)
 	if err != nil {
 		return fmt.Errorf("create API request: %w", err)
 	}
@@ -287,7 +385,69 @@ func writeStatus(writer io.Writer, status api.Status) error {
 		}
 	}
 	_, err := fmt.Fprintf(writer, "Torrents: %d\n", status.TorrentCount)
+	if err != nil {
+		return err
+	}
+	summary := status.Replication
+	_, err = fmt.Fprintf(writer, "Replication: %d pending, %d active, %d replicated, %d failed/blocked\n",
+		summary.Pending, summary.Active, summary.Replicated, summary.Failed+summary.Blocked)
 	return err
+}
+
+func writeTransfers(writer io.Writer, records []replication.Record) error {
+	if len(records) == 0 {
+		_, err := fmt.Fprintln(writer, "No transfers.")
+		return err
+	}
+	w := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
+	if _, err := fmt.Fprintln(w, "HASH\tSIZE\tSTATE\tATTEMPTS\tLAST ATTEMPT\tVERIFIED\tERROR"); err != nil {
+		return err
+	}
+	for _, record := range records {
+		verified := "no"
+		if record.VerifiedAt != nil {
+			verified = "yes"
+		}
+		if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\t%s\t%s\n",
+			cleanCell(record.Hash), humanize.Bytes(uint64(max(record.Manifest.TotalSize, int64(0)))), cleanCell(string(record.State)),
+			record.Attempts, displayTime(record.LastAttemptAt), verified, cleanCell(record.LastError)); err != nil {
+			return err
+		}
+	}
+	return w.Flush()
+}
+
+func writeTransferDetail(writer io.Writer, record replication.Record) error {
+	if _, err := fmt.Fprintf(writer, "Hash: %s\nState: %s\nSelected size: %s\nSelected files: %d\nAttempts: %d\nLast attempt: %s\n",
+		cleanCell(record.Hash), cleanCell(string(record.State)),
+		humanize.Bytes(uint64(max(record.Manifest.TotalSize, int64(0)))), len(record.Manifest.Files), record.Attempts, displayTime(record.LastAttemptAt)); err != nil {
+		return err
+	}
+	if record.VerifiedAt != nil {
+		if _, err := fmt.Fprintf(writer, "Verification: verified at %s\n", record.VerifiedAt.Format(time.RFC3339)); err != nil {
+			return err
+		}
+	} else if _, err := fmt.Fprintln(writer, "Verification: not verified"); err != nil {
+		return err
+	}
+	if record.NextAttemptAt != nil {
+		if _, err := fmt.Fprintf(writer, "Next attempt: %s\n", record.NextAttemptAt.Format(time.RFC3339)); err != nil {
+			return err
+		}
+	}
+	if record.LastError != "" {
+		if _, err := fmt.Fprintf(writer, "Last error: %s\n", cleanCell(record.LastError)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func displayTime(value *time.Time) string {
+	if value == nil {
+		return "-"
+	}
+	return value.Format(time.RFC3339)
 }
 
 func writeTorrents(writer io.Writer, torrents []api.Torrent) error {

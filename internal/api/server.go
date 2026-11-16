@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/anish-chanda/seedcache/internal/replication"
 	"github.com/rs/zerolog"
 )
 
@@ -19,7 +20,19 @@ type Discovery interface {
 	Detail(context.Context, string) (TorrentDetail, error)
 }
 
-func New(discovery Discovery, version string, log zerolog.Logger) http.Handler {
+type Transfers interface {
+	List(context.Context) ([]replication.Record, error)
+	Get(context.Context, string) (replication.Record, error)
+	Queue(context.Context, string) (replication.Record, error)
+	Retry(context.Context, string) (replication.Record, error)
+	Summary(context.Context) (replication.Summary, error)
+}
+
+func New(discovery Discovery, version string, log zerolog.Logger, transferServices ...Transfers) http.Handler {
+	var transfers Transfers
+	if len(transferServices) > 0 {
+		transfers = transferServices[0]
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "endpoint not found")
@@ -27,7 +40,18 @@ func New(discovery Discovery, version string, log zerolog.Logger) http.Handler {
 	routes := map[string]http.HandlerFunc{
 		"/api/v1/health":  func(w http.ResponseWriter, r *http.Request) { writeJSON(w, http.StatusOK, Health{Status: "ok"}) },
 		"/api/v1/version": func(w http.ResponseWriter, r *http.Request) { writeJSON(w, http.StatusOK, Version{Version: version}) },
-		"/api/v1/status":  func(w http.ResponseWriter, r *http.Request) { writeJSON(w, http.StatusOK, discovery.Status()) },
+		"/api/v1/status": func(w http.ResponseWriter, r *http.Request) {
+			status := discovery.Status()
+			if transfers != nil {
+				summary, err := transfers.Summary(r.Context())
+				if err != nil {
+					writeOperationError(w, err, "replication")
+					return
+				}
+				status.Replication = summary
+			}
+			writeJSON(w, http.StatusOK, status)
+		},
 		"/api/v1/torrents": func(w http.ResponseWriter, r *http.Request) {
 			torrents, err := discovery.Torrents()
 			if err != nil {
@@ -49,15 +73,56 @@ func New(discovery Discovery, version string, log zerolog.Logger) http.Handler {
 		},
 	}
 	for path, handler := range routes {
-		mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodGet {
-				w.Header().Set("Allow", "GET")
-				writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be GET")
-				return
-			}
-			handler(w, r)
-		})
+		mux.HandleFunc(path, allowMethod(http.MethodGet, handler))
 	}
+	mux.HandleFunc("/api/v1/transfers", allowMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
+		if transfers == nil {
+			writeTransferUnavailable(w)
+			return
+		}
+		records, err := transfers.List(r.Context())
+		if err != nil {
+			writeOperationError(w, err, "transfer")
+			return
+		}
+		writeJSON(w, http.StatusOK, TransferList{Transfers: records})
+	}))
+	mux.HandleFunc("/api/v1/transfers/{hash}", allowMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
+		if transfers == nil {
+			writeTransferUnavailable(w)
+			return
+		}
+		record, err := transfers.Get(r.Context(), r.PathValue("hash"))
+		if err != nil {
+			writeOperationError(w, err, "transfer")
+			return
+		}
+		writeJSON(w, http.StatusOK, record)
+	}))
+	mux.HandleFunc("/api/v1/torrents/{hash}/sync", allowMethod(http.MethodPost, func(w http.ResponseWriter, r *http.Request) {
+		if transfers == nil {
+			writeTransferUnavailable(w)
+			return
+		}
+		record, err := transfers.Queue(r.Context(), r.PathValue("hash"))
+		if err != nil {
+			writeOperationError(w, err, "torrent")
+			return
+		}
+		writeJSON(w, http.StatusAccepted, record)
+	}))
+	mux.HandleFunc("/api/v1/transfers/{hash}/retry", allowMethod(http.MethodPost, func(w http.ResponseWriter, r *http.Request) {
+		if transfers == nil {
+			writeTransferUnavailable(w)
+			return
+		}
+		record, err := transfers.Retry(r.Context(), r.PathValue("hash"))
+		if err != nil {
+			writeOperationError(w, err, "transfer")
+			return
+		}
+		writeJSON(w, http.StatusAccepted, record)
+	}))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
@@ -75,6 +140,39 @@ func New(discovery Discovery, version string, log zerolog.Logger) http.Handler {
 			log.WithLevel(level).Dur("duration", time.Since(start)).Msgf("%d %s %s", sw.status, r.Method, r.URL.Path)
 		}
 	})
+}
+
+func allowMethod(method string, handler http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != method {
+			w.Header().Set("Allow", method)
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method must be "+method)
+			return
+		}
+		handler(w, r)
+	}
+}
+
+func writeTransferUnavailable(w http.ResponseWriter) {
+	writeError(w, http.StatusServiceUnavailable, "replication_unavailable", "replication service is unavailable")
+}
+
+func writeOperationError(w http.ResponseWriter, err error, entity string) {
+	var blocked *replication.BlockedError
+	switch {
+	case errors.Is(err, replication.ErrNotFound):
+		writeError(w, http.StatusNotFound, entity+"_not_found", err.Error())
+	case errors.Is(err, replication.ErrConflict):
+		writeError(w, http.StatusConflict, "transfer_conflict", err.Error())
+	case errors.As(err, &blocked):
+		writeError(w, http.StatusConflict, "transfer_blocked", err.Error())
+	case errors.Is(err, replication.ErrIneligible):
+		writeError(w, http.StatusConflict, "torrent_ineligible", err.Error())
+	case errors.Is(err, replication.ErrUnavailable):
+		writeError(w, http.StatusServiceUnavailable, "replication_unavailable", err.Error())
+	default:
+		writeError(w, http.StatusInternalServerError, "replication_failed", err.Error())
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

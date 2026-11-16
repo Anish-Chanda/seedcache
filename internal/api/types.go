@@ -1,6 +1,10 @@
 package api
 
-import "time"
+import (
+	"time"
+
+	"github.com/anish-chanda/seedcache/internal/replication"
+)
 
 type Health struct {
 	Status string `json:"status"`
@@ -9,9 +13,10 @@ type Version struct {
 	Version string `json:"version"`
 }
 type Status struct {
-	StartedAt    time.Time  `json:"started_at"`
-	QBittorrent  Connection `json:"qbittorrent"`
-	TorrentCount int        `json:"torrent_count"`
+	StartedAt    time.Time           `json:"started_at"`
+	QBittorrent  Connection          `json:"qbittorrent"`
+	TorrentCount int                 `json:"torrent_count"`
+	Replication  replication.Summary `json:"replication"`
 }
 type Connection struct {
 	Connected      bool       `json:"connected"`
@@ -47,6 +52,9 @@ type TorrentDetail struct {
 }
 type TorrentList struct {
 	Torrents []Torrent `json:"torrents"`
+}
+type TransferList struct {
+	Transfers []replication.Record `json:"transfers"`
 }
 type Error struct {
 	Code    string `json:"code"`

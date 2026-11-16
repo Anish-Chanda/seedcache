@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/anish-chanda/seedcache/internal/api"
+	"github.com/anish-chanda/seedcache/internal/replication"
 	"github.com/spf13/cobra"
 )
 
@@ -78,6 +79,100 @@ func TestStatusJSONUsesStatusEndpoint(t *testing.T) {
 	}
 	if !got.StartedAt.Equal(started) || got.TorrentCount != 3 || !got.QBittorrent.Connected {
 		t.Fatalf("unexpected status: %+v", got)
+	}
+}
+
+func TestTransfersJSONUsesTransfersEndpoint(t *testing.T) {
+	withTransport(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/transfers" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			return apiResponse(http.StatusNotFound, `{"error":{"code":"not_found","message":"endpoint not found"}}`), nil
+		}
+		return apiResponse(http.StatusOK, `{"transfers":[{"hash":"abc","state":"replicated","manifest":{"files":[],"total_size":1024},"attempts":1,"verified_at":"2025-01-02T03:04:05Z"}]}`), nil
+	}))
+
+	output, err := execute(t, New("test", nil), "--server", "http://seedcache.test", "transfers", "--json")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	var got api.TransferList
+	if err := json.Unmarshal([]byte(output), &got); err != nil {
+		t.Fatalf("output is not transfer JSON: %v\n%s", err, output)
+	}
+	if len(got.Transfers) != 1 || got.Transfers[0].Hash != "abc" || got.Transfers[0].State != replication.StateReplicated {
+		t.Fatalf("unexpected transfers: %+v", got)
+	}
+}
+
+func TestTransfersHumanOutputShowsStateAndVerification(t *testing.T) {
+	withTransport(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/transfers" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			return apiResponse(http.StatusNotFound, `{"error":{"code":"not_found","message":"endpoint not found"}}`), nil
+		}
+		return apiResponse(http.StatusOK, `{"transfers":[{"hash":"abc","state":"blocked","manifest":{"files":[],"total_size":1024},"attempts":1,"last_attempt_at":"2025-01-02T03:04:05Z","last_error":"unsafe path"}]}`), nil
+	}))
+
+	output, err := execute(t, New("test", nil), "--server", "http://seedcache.test", "transfers")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	for _, expected := range []string{"HASH", "SIZE", "STATE", "ATTEMPTS", "LAST ATTEMPT", "VERIFIED", "ERROR", "abc", "blocked", "unsafe path", "no"} {
+		if !strings.Contains(output, expected) {
+			t.Errorf("output does not contain %q:\n%s", expected, output)
+		}
+	}
+}
+
+func TestTransferShowHumanOutput(t *testing.T) {
+	withTransport(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/transfers/abc" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			return apiResponse(http.StatusNotFound, `{"error":{"code":"not_found","message":"endpoint not found"}}`), nil
+		}
+		return apiResponse(http.StatusOK, `{"hash":"abc","state":"failed","manifest":{"files":[{"path":"movie.mkv","size":2048}],"total_size":2048},"attempts":2,"last_error":"destination unavailable"}`), nil
+	}))
+
+	output, err := execute(t, New("test", nil), "--server", "http://seedcache.test", "transfers", "show", "abc")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	for _, expected := range []string{"Hash: abc", "State: failed", "Selected size:", "Selected files: 1", "Attempts: 2", "Verification: not verified", "Last error: destination unavailable"} {
+		if !strings.Contains(output, expected) {
+			t.Errorf("output does not contain %q:\n%s", expected, output)
+		}
+	}
+	if strings.Contains(output, "%") {
+		t.Fatalf("output shows unsupported progress: %s", output)
+	}
+}
+
+func TestSyncAndRetryUsePOSTAndEmitJSON(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		path string
+	}{
+		{name: "sync", path: "/api/v1/torrents/abc/sync"},
+		{name: "retry", path: "/api/v1/transfers/abc/retry"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			withTransport(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if r.Method != http.MethodPost || r.URL.Path != tt.path {
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+					return apiResponse(http.StatusNotFound, `{"error":{"code":"not_found","message":"endpoint not found"}}`), nil
+				}
+				return apiResponse(http.StatusAccepted, `{"hash":"abc","state":"pending","manifest":{"files":[],"total_size":0}}`), nil
+			}))
+
+			output, err := execute(t, New("test", nil), "--server", "http://seedcache.test", tt.name, "abc", "--json")
+			if err != nil {
+				t.Fatalf("Execute() error = %v", err)
+			}
+			var got replication.Record
+			if err := json.Unmarshal([]byte(output), &got); err != nil || got.Hash != "abc" || got.State != replication.StatePending {
+				t.Fatalf("output is not accepted transfer JSON: %v\n%s", err, output)
+			}
+		})
 	}
 }
 
