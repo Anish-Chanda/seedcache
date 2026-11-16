@@ -116,6 +116,132 @@ func (r *Runner) Verify(ctx context.Context, manifest Manifest) error {
 	return nil
 }
 
+// DestinationAvailable confirms that every manifest file still exists on the
+// destination as a regular file with its recorded size. It intentionally does
+// not hash the remote payload.
+func (r *Runner) DestinationAvailable(ctx context.Context, manifest Manifest) error {
+	files, _, err := validateManifest(manifest)
+	if err != nil {
+		return err
+	}
+	_, destinationRoot, target, err := r.paths()
+	if err != nil {
+		return err
+	}
+	available, err := r.destinationFilesAvailable(ctx, target, destinationRoot, files)
+	if err != nil {
+		return err
+	}
+	for index, found := range available {
+		if !found {
+			return &BlockedError{Reason: fmt.Sprintf("destination payload %q is missing or has an unexpected size", files[index].Path)}
+		}
+	}
+	return nil
+}
+
+// Restore copies only manifest-listed files from the destination to the source.
+// Existing source files are left untouched, and mismatching files block the
+// operation before rsync starts.
+func (r *Runner) Restore(ctx context.Context, manifest Manifest) error {
+	files, _, err := validateManifest(manifest)
+	if err != nil {
+		return err
+	}
+	sourceRoot, destinationRoot, target, err := r.paths()
+	if err != nil {
+		return err
+	}
+	if err := r.checkCapabilities(ctx); err != nil {
+		return err
+	}
+	available, err := r.destinationFilesAvailable(ctx, target, destinationRoot, files)
+	if err != nil {
+		return err
+	}
+	for index, found := range available {
+		if !found {
+			return &BlockedError{Reason: fmt.Sprintf("destination payload %q is missing or has an unexpected size", files[index].Path)}
+		}
+	}
+
+	present, err := preflightRestoreFiles(sourceRoot, files)
+	if err != nil {
+		return err
+	}
+	existing := make([]File, 0, len(files))
+	for index, found := range present {
+		if found {
+			existing = append(existing, files[index])
+		}
+	}
+	if len(existing) > 0 {
+		output, err := runRsyncOutput(ctx, r.reverseRsyncArgs(target, destinationRoot, sourceRoot, true), fileList(existing))
+		if err != nil {
+			return fmt.Errorf("could not compare existing source files with destination: %w", err)
+		}
+		changed, err := itemizedFileChanges(output)
+		if err != nil {
+			return err
+		}
+		if changed > 0 {
+			return &BlockedError{Reason: "a source payload path already contains different data"}
+		}
+	}
+
+	if err := runRsync(ctx, r.reverseRsyncArgs(target, destinationRoot, sourceRoot, false), fileList(files)); err != nil {
+		return fmt.Errorf("rsync restoration failed: %w", err)
+	}
+	if err := validateLocalFiles(sourceRoot, files); err != nil {
+		return fmt.Errorf("restored source payload is incomplete or unsafe: %w", err)
+	}
+	return nil
+}
+
+// VerifyRestored compares destination content to the restored source files with
+// rsync checksums, without modifying either side.
+func (r *Runner) VerifyRestored(ctx context.Context, manifest Manifest) error {
+	files, _, err := validateManifest(manifest)
+	if err != nil {
+		return err
+	}
+	sourceRoot, destinationRoot, target, err := r.paths()
+	if err != nil {
+		return err
+	}
+	if err := validateLocalFiles(sourceRoot, files); err != nil {
+		return err
+	}
+	if err := r.checkCapabilities(ctx); err != nil {
+		return err
+	}
+	available, err := r.destinationFilesAvailable(ctx, target, destinationRoot, files)
+	if err != nil {
+		return err
+	}
+	for index, found := range available {
+		if !found {
+			return &BlockedError{Reason: fmt.Sprintf("destination payload %q is missing or has an unexpected size", files[index].Path)}
+		}
+	}
+
+	output, err := runRsyncOutput(ctx, r.reverseRsyncArgs(target, destinationRoot, sourceRoot, true), fileList(files))
+	if err != nil {
+		return fmt.Errorf("rsync restoration checksum verification failed: %w", err)
+	}
+	changed, err := itemizedFileChanges(output)
+	if err != nil {
+		return err
+	}
+	if changed > 0 {
+		return &BlockedError{Reason: "restored source payload does not match the destination copy"}
+	}
+	if err := validateLocalFiles(sourceRoot, files); err != nil {
+		return fmt.Errorf("source changed during restoration verification: %w", err)
+	}
+	return nil
+}
+
 func (r *Runner) paths() (sourceRoot, destinationRoot, target string, err error) {
 	_, sourceRoot, err = sourceRoots(r.source)
 	if err != nil {
@@ -241,6 +367,68 @@ func (r *Runner) rsyncArgs(target, destinationRoot, sourceRoot string, verify bo
 	}
 	args = append(args, sourceRoot+string(filepath.Separator), target+":"+destinationRoot+string(filepath.Separator))
 	return args
+}
+
+func (r *Runner) reverseRsyncArgs(target, destinationRoot, sourceRoot string, verify bool) []string {
+	args := []string{
+		"--rsh=ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=15 -oServerAliveInterval=15 -oServerAliveCountMax=2",
+		"--rsync-path=env -u RSYNC_CHECKSUM_LIST rsync",
+		"-s",
+		"--no-iconv",
+		"--no-links",
+		"--no-recursive",
+		"--files-from=-",
+		"--from0",
+		"--relative",
+		"--mkpath",
+		"--partial-dir=" + partialDirectory,
+		"--timeout=120",
+	}
+	if verify {
+		args = append(args, "--checksum", "--dry-run", "--itemize-changes", "--out-format=%i")
+	} else {
+		args = append(args, "--ignore-existing")
+	}
+	args = append(args, target+":"+destinationRoot+string(filepath.Separator), sourceRoot+string(filepath.Separator))
+	return args
+}
+
+func (r *Runner) destinationFilesAvailable(ctx context.Context, target, destinationRoot string, files []File) ([]bool, error) {
+	sshPath, err := exec.LookPath("ssh")
+	if err != nil {
+		return nil, &BlockedError{Reason: fmt.Sprintf("OpenSSH client is unavailable: %v", err)}
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, checkTimeout)
+	defer cancel()
+	output, err := runSSH(checkCtx, sshPath, target, "sh -c "+shellQuote(destinationAvailabilityScript), availabilityInput(destinationRoot, files))
+	if err != nil {
+		if checkCtx.Err() != nil {
+			return nil, fmt.Errorf("destination availability check canceled: %w", checkCtx.Err())
+		}
+		var blocked *BlockedError
+		if errors.As(err, &blocked) {
+			return nil, blocked
+		}
+		if sshConfigurationError(err) || missingRemoteTool(err) {
+			return nil, &BlockedError{Reason: err.Error()}
+		}
+		return nil, fmt.Errorf("destination availability check failed: %w", err)
+	}
+	lines := strings.Split(strings.TrimSuffix(string(output), "\n"), "\n")
+	if len(lines) != len(files)+1 || lines[0] != "SC1" {
+		return nil, errors.New("destination availability check returned an invalid response")
+	}
+	available := make([]bool, len(files))
+	for i, line := range lines[1:] {
+		switch line {
+		case "0":
+		case "1":
+			available[i] = true
+		default:
+			return nil, errors.New("destination availability check returned an invalid file status")
+		}
+	}
+	return available, nil
 }
 
 func (r *Runner) preflight(ctx context.Context, target, destinationRoot string, files []File) ([]bool, error) {
@@ -383,7 +571,7 @@ func runRsync(ctx context.Context, args []string, input []byte) error {
 }
 
 func runRsyncOutput(ctx context.Context, args []string, input []byte) ([]byte, error) {
-	cmd := contextCommand(ctx, "rsync", args...)
+	cmd := rsyncContextCommand(ctx, args...)
 	cmd.Env = envWithoutRsyncChecksumList()
 	cmd.Stdin = bytes.NewReader(input)
 	var stdout, stderr bytes.Buffer
@@ -407,6 +595,32 @@ func runRsyncOutput(ctx context.Context, args []string, input []byte) ([]byte, e
 		return nil, err
 	}
 	return stdout.Bytes(), nil
+}
+
+func rsyncContextCommand(ctx context.Context, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "rsync", args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return terminateProcessGroup(cmd.Process.Pid, processWaitDelay)
+	}
+	cmd.WaitDelay = processWaitDelay
+	return cmd
+}
+
+func terminateProcessGroup(processGroup int, gracePeriod time.Duration) error {
+	if err := syscall.Kill(-processGroup, syscall.SIGTERM); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		return err
+	}
+	time.AfterFunc(gracePeriod, func() {
+		_ = syscall.Kill(-processGroup, syscall.SIGKILL)
+	})
+	return nil
 }
 
 func fileList(files []File) []byte {
@@ -438,6 +652,108 @@ func preflightInput(destinationRoot string, files []File) []byte {
 		input.WriteByte('\n')
 	}
 	return input.Bytes()
+}
+
+func availabilityInput(destinationRoot string, files []File) []byte {
+	var input bytes.Buffer
+	_, _ = fmt.Fprintf(&input, "%d\n%s\n", len(files), hex.EncodeToString([]byte(destinationRoot)))
+	for _, file := range canonicalFiles(files) {
+		input.WriteString(hex.EncodeToString([]byte(file.Path)))
+		input.WriteByte('\n')
+		_, _ = fmt.Fprintf(&input, "%d\n", file.Size)
+	}
+	return input.Bytes()
+}
+
+func preflightRestoreFiles(sourceRoot string, files []File) ([]bool, error) {
+	if _, err := lstatPathComponents(sourceRoot); err != nil {
+		return nil, err
+	}
+	present := make([]bool, len(files))
+	for index, file := range files {
+		relative := filepath.FromSlash(file.Path)
+		components := strings.Split(relative, string(filepath.Separator))
+		parent := sourceRoot
+		parentExists := true
+		for _, component := range components[:len(components)-1] {
+			parent = filepath.Join(parent, component)
+			info, err := os.Lstat(parent)
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					parentExists = false
+					break
+				}
+				return nil, fmt.Errorf("inspect source restore path %q: %w", file.Path, err)
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				return nil, &BlockedError{Reason: fmt.Sprintf("source restore path %q traverses a symlink", file.Path)}
+			}
+			if !info.IsDir() {
+				return nil, &BlockedError{Reason: fmt.Sprintf("source restore path component in %q is not a directory", file.Path)}
+			}
+		}
+		if !parentExists {
+			continue
+		}
+		if err := validatePartialPath(parent, components[len(components)-1], file.Path); err != nil {
+			return nil, err
+		}
+		target := filepath.Join(parent, components[len(components)-1])
+		info, err := os.Lstat(target)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, fmt.Errorf("inspect source restore target %q: %w", file.Path, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, &BlockedError{Reason: fmt.Sprintf("source restore target %q is a symlink", file.Path)}
+		}
+		if !info.Mode().IsRegular() {
+			return nil, &BlockedError{Reason: fmt.Sprintf("source restore target %q is not a regular file", file.Path)}
+		}
+		if info.Size() != file.Size {
+			return nil, &BlockedError{Reason: fmt.Sprintf("source restore target %q already exists with a different size", file.Path)}
+		}
+		present[index] = true
+	}
+	return present, nil
+}
+
+func validatePartialPath(parent, leaf, manifestPath string) error {
+	partialDir := filepath.Join(parent, partialDirectory)
+	info, err := os.Lstat(partialDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("inspect rsync partial directory for %q: %w", manifestPath, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return &BlockedError{Reason: fmt.Sprintf("rsync partial directory for %q is a symlink", manifestPath)}
+	}
+	if !info.IsDir() {
+		return &BlockedError{Reason: fmt.Sprintf("rsync partial path for %q is not a directory", manifestPath)}
+	}
+	partialFile := filepath.Join(partialDir, leaf)
+	info, err = os.Lstat(partialFile)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("inspect rsync partial file for %q: %w", manifestPath, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return &BlockedError{Reason: fmt.Sprintf("rsync partial file for %q is a symlink", manifestPath)}
+	}
+	if !info.Mode().IsRegular() {
+		return &BlockedError{Reason: fmt.Sprintf("rsync partial file for %q is not a regular file", manifestPath)}
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Nlink != 1 {
+		return &BlockedError{Reason: fmt.Sprintf("rsync partial file for %q has multiple hard links or an unverifiable link count", manifestPath)}
+	}
+	return nil
 }
 
 func shellQuote(value string) string {
@@ -528,6 +844,106 @@ func itemizedFileChanges(output []byte) (int, error) {
 	}
 	return count, nil
 }
+
+const destinationAvailabilityScript = `set -eu
+fail() { printf '%s\n' "$1" >&2; exit 2; }
+blocked() { printf 'SC_BLOCKED: %s\n' "$1" >&2; exit 2; }
+command -v awk >/dev/null 2>&1 || blocked "remote awk is unavailable"
+command -v stat >/dev/null 2>&1 || blocked "remote stat is unavailable"
+decode_hex() {
+	_escaped=$(printf '%s' "$1" | awk 'BEGIN { digits = "0123456789abcdef" } { if (length($0) % 2) exit 1; for (i = 1; i <= length($0); i += 2) { a = index(digits, tolower(substr($0, i, 1))) - 1; b = index(digits, tolower(substr($0, i + 1, 1))) - 1; if (a < 0 || b < 0) exit 1; printf "\\%03o", a * 16 + b } }') || fail "invalid encoded path"
+	_decoded=$(printf '%b.' "$_escaped") || fail "could not decode path"
+	DECODED=${_decoded%.}
+}
+check_directories() {
+	case "$1" in /*) ;; *) return 3 ;; esac
+	[ "$1" != / ] || return 3
+	_rest=${1#/}
+	_current=
+	while [ -n "$_rest" ]; do
+		case "$_rest" in */*) _part=${_rest%%/*}; _rest=${_rest#*/} ;; *) _part=$_rest; _rest= ;; esac
+		[ -n "$_part" ] || return 3
+		_current=${_current}/$_part
+		[ ! -L "$_current" ] || return 2
+		if [ -e "$_current" ]; then
+			[ -d "$_current" ] || return 3
+		else
+			return 1
+		fi
+	done
+	return 0
+}
+IFS= read -r _count || fail "missing availability file count"
+case "$_count" in ''|*[!0-9]*) fail "invalid availability file count" ;; esac
+IFS= read -r _hex_root || fail "missing destination root"
+decode_hex "$_hex_root"
+_root=$DECODED
+case "$_root" in /*) ;; *) blocked "destination root is not absolute" ;; esac
+[ "$_root" != / ] || blocked "destination root must not be the filesystem root"
+if check_directories "$_root"; then
+	_root_exists=1
+else
+	_status=$?
+	case "$_status" in
+		1) _root_exists=0 ;;
+		2) blocked "destination root traverses a symlink" ;;
+		*) blocked "destination root component is not a directory" ;;
+	esac
+fi
+printf 'SC1\n'
+_index=0
+while [ "$_index" -lt "$_count" ]; do
+	IFS= read -r _hex_rel || fail "missing destination file path"
+	IFS= read -r _expected || fail "missing expected destination file size"
+	case "$_expected" in ''|*[!0-9]*) fail "invalid expected destination file size" ;; esac
+	decode_hex "$_hex_rel"
+	_rel=$DECODED
+	case "$_rel" in
+		''|/*|.|..|./*|../*|*/.|*/./*|*/..|*/../*|*//*|.seedcache-partial|.seedcache-partial/*|*/.seedcache-partial|*/.seedcache-partial/*)
+			blocked "manifest contains an unsafe destination path" ;;
+	esac
+	if [ "$_root_exists" -eq 0 ]; then
+		printf '0\n'
+		_index=$((_index + 1))
+		continue
+	fi
+	_current=$_root
+	_rest=$_rel
+	_missing=0
+	while :; do
+		case "$_rest" in */*) _part=${_rest%%/*}; _rest=${_rest#*/} ;; *) break ;; esac
+		_current=${_current}/$_part
+		[ ! -L "$_current" ] || blocked "destination path traverses a symlink"
+		if [ -e "$_current" ]; then
+			[ -d "$_current" ] || blocked "destination path component is not a directory"
+		else
+			_missing=1
+			break
+		fi
+	done
+	if [ "$_missing" -eq 1 ]; then
+		printf '0\n'
+		_index=$((_index + 1))
+		continue
+	fi
+	_target=${_current}/$_rest
+	[ ! -L "$_target" ] || blocked "destination file is a symlink"
+	if [ ! -e "$_target" ]; then
+		printf '0\n'
+		_index=$((_index + 1))
+		continue
+	fi
+	[ -f "$_target" ] || blocked "destination file is not a regular file"
+	_actual=$(stat -c %s -- "$_target") || fail "could not read destination file size"
+	case "$_actual" in ''|*[!0-9]*) fail "invalid destination file size" ;; esac
+	if [ "$_actual" = "$_expected" ]; then
+		printf '1\n'
+	else
+		printf '0\n'
+	fi
+	_index=$((_index + 1))
+done
+`
 
 const destinationPreflightScript = `set -eu
 fail() { printf '%s\n' "$1" >&2; exit 2; }
