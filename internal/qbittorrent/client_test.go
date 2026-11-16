@@ -461,16 +461,24 @@ func TestMutationRetriesExpiredSID(t *testing.T) {
 }
 
 func TestRecheckRejectsHTTP200WithoutObservedCheck(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var recheckCalls atomic.Int32
+	var recheckPolls atomic.Int32
 	var state atomic.Value
 	state.Store("stoppedUP")
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v2/auth/login", loginHandler(t, new(atomic.Int32)))
 	mux.HandleFunc("/api/v2/torrents/recheck", func(w http.ResponseWriter, r *http.Request) {
 		requireMutationRequest(t, r, "recheck", testHash)
+		recheckCalls.Add(1)
 		_, _ = io.WriteString(w, "Ok.")
 	})
 	mux.HandleFunc("/api/v2/torrents/info", func(w http.ResponseWriter, r *http.Request) {
 		requireReadRequest(t, r, "sid-1", http.MethodGet)
+		if recheckCalls.Load() > 0 && recheckPolls.Add(1) == 2 {
+			cancel()
+		}
 		if r.URL.Query().Get("filter") == "stopped" {
 			_, _ = io.WriteString(w, `[{"hash":"`+testHash+`","state":"stoppedUP"}]`)
 			return
@@ -482,21 +490,29 @@ func TestRecheckRejectsHTTP200WithoutObservedCheck(t *testing.T) {
 		_, _ = io.WriteString(w, `[{"index":0,"name":"selected.bin","size":4,"priority":1,"progress":1}]`)
 	})
 	client, _ := newTestClient(t, mux)
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
-	defer cancel()
 	err := client.Recheck(ctx, testHash)
-	if err == nil || !strings.Contains(err.Error(), "requested recheck to start") {
-		t.Fatalf("Recheck() error = %v, want operation-state timeout", err)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Recheck() error = %v, want cancellation without confirmed recheck", err)
+	}
+	if got := recheckCalls.Load(); got != 1 {
+		t.Fatalf("recheck calls = %d, want one acknowledged request", got)
+	}
+	if got := recheckPolls.Load(); got < 2 {
+		t.Fatalf("recheck polls = %d, want continued polling after unchanged state", got)
 	}
 }
 
 func TestStopRequiresConfirmedStoppedFilter(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stopCalls atomic.Int32
 	var state atomic.Value
 	state.Store("uploading")
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v2/auth/login", loginHandler(t, new(atomic.Int32)))
 	mux.HandleFunc("/api/v2/torrents/stop", func(w http.ResponseWriter, r *http.Request) {
 		requireMutationRequest(t, r, "stop", testHash)
+		stopCalls.Add(1)
 		_, _ = io.WriteString(w, "Ok.")
 	})
 	mux.HandleFunc("/api/v2/torrents/info", func(w http.ResponseWriter, r *http.Request) {
@@ -505,13 +521,15 @@ func TestStopRequiresConfirmedStoppedFilter(t *testing.T) {
 			_, _ = io.WriteString(w, `[]`)
 			return
 		}
+		cancel()
 		_, _ = io.WriteString(w, `[{"hash":"`+testHash+`","state":"`+state.Load().(string)+`"}]`)
 	})
 	client, _ := newTestClient(t, mux)
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
-	defer cancel()
-	if err := client.Stop(ctx, testHash); err == nil || !strings.Contains(err.Error(), "last state \"uploading\"") {
-		t.Fatalf("Stop() error = %v, want timeout with last state", err)
+	if err := client.Stop(ctx, testHash); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Stop() error = %v, want cancellation without confirmed stop", err)
+	}
+	if got := stopCalls.Load(); got != 1 {
+		t.Fatalf("stop calls = %d, want one acknowledged request", got)
 	}
 }
 
