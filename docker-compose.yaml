@@ -1,0 +1,24 @@
+services:
+  seedcache:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    restart: unless-stopped
+    command: ["--config", "/etc/seedcache/config.yaml", "daemon"]
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - "./config.yaml:/etc/seedcache/config.yaml:ro"
+      - "seedcache-data:/var/lib/seedcache"
+    # Pass through credential variables set in the host shell. When absent,
+    # they stay unset and the config file values remain in effect.
+    environment:
+      - QBITTORRENT_USERNAME
+      - QBITTORRENT_PASSWORD
+      - QBITTORRENT_USERNAME_FILE
+      - QBITTORRENT_PASSWORD_FILE
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  seedcache-data:

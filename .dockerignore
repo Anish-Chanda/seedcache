@@ -1,0 +1,15 @@
+.git
+.gitignore
+.env
+config.yaml
+*.db
+*.db-shm
+*.db-wal
+bin/
+dist/
+coverage.out
+
+.agents
+.codex
+.aws
+/seedcache
