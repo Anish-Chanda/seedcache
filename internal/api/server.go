@@ -42,6 +42,7 @@ func New(discovery Discovery, version string, log zerolog.Logger, transferServic
 	}
 	lifecycle, _ := transfers.(Lifecycle)
 	mux := http.NewServeMux()
+	registerAdoptionRoutes(mux, transfers)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "endpoint not found")
 	})
@@ -209,6 +210,8 @@ func applyCache(torrent *Torrent, record replication.Record) {
 	}
 	torrent.CacheError = record.CacheError
 	torrent.CacheOperation = record.CacheOperation
+	torrent.ReplicationState = record.State
+	torrent.VerifiedAt = record.VerifiedAt
 }
 
 func allowMethod(method string, handler http.HandlerFunc) http.HandlerFunc {
@@ -267,3 +270,5 @@ func (w *statusWriter) WriteHeader(status int) {
 	w.status = status
 	w.ResponseWriter.WriteHeader(status)
 }
+
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }

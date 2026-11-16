@@ -41,7 +41,7 @@ func TestOpenInitializesMigrationsAndNoOpLogs(t *testing.T) {
 		t.Fatalf("reopen() error = %v", err)
 	}
 	defer db.Close()
-	if err := assertAppliedMigration(db, 3); err != nil {
+	if err := assertAppliedMigration(db, 4); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(logs.String(), "SQLite database schema is up to date") {
@@ -88,7 +88,7 @@ func TestOpenPreservesExistingDataAndUserVersion(t *testing.T) {
 	if userVersion != 1 {
 		t.Errorf("user_version = %d, want preserved value 1", userVersion)
 	}
-	if err := assertAppliedMigration(db, 3); err != nil {
+	if err := assertAppliedMigration(db, 4); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -160,7 +160,7 @@ func TestOpenRejectsNewerAndDirtyMigrationVersions(t *testing.T) {
 		dirty   bool
 		want    string
 	}{
-		{name: "newer", version: 4, want: "no migration found for version 4"},
+		{name: "newer", version: 5, want: "no migration found for version 5"},
 		{name: "dirty", version: 1, dirty: true, want: "dirty"},
 	}
 	for _, tt := range tests {
@@ -241,7 +241,7 @@ func fixtureMigrations(first, second string) fs.FS {
 }
 
 func assertMigrationSchema(db *sql.DB) error {
-	if err := assertAppliedMigration(db, 3); err != nil {
+	if err := assertAppliedMigration(db, 4); err != nil {
 		return err
 	}
 	columns, err := db.Query("PRAGMA table_info(replications)")
@@ -332,7 +332,7 @@ func TestOpenUpgradesPhaseOneSchema(t *testing.T) {
 		t.Fatalf("Open() upgrading Phase 1 database: %v", err)
 	}
 	defer db.Close()
-	if err := assertAppliedMigration(db, 3); err != nil {
+	if err := assertAppliedMigration(db, 4); err != nil {
 		t.Fatal(err)
 	}
 	var table string
@@ -368,4 +368,53 @@ func TestOpenSetupErrors(t *testing.T) {
 			t.Fatalf("Open returned %v, %v for a directory", db, err)
 		}
 	})
+}
+
+func TestAdoptionMigrationPreservesVerifiedRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "before-adoption.db")
+	db, err := openSQLite(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := fstest.MapFS{}
+	for _, name := range []string{"000001_initial.up.sql", "000001_initial.down.sql", "000002_replications.up.sql", "000002_replications.down.sql", "000003_cache_lifecycle.up.sql", "000003_cache_lifecycle.down.sql"} {
+		contents, err := migrationFiles.ReadFile("migrations/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files["migrations/"+name] = &fstest.MapFile{Data: contents}
+	}
+	if err := runMigrations(context.Background(), db, files, zerolog.Nop()); err != nil {
+		t.Fatal(err)
+	}
+	db, err = openSQLite(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := `{"files":[{"path":"movies/example.bin","size":4,"index":0}],"total_size":4}`
+	verified := "2026-01-01T00:00:00.000000000Z"
+	_, err = db.Exec(`INSERT INTO replications (hash,state,manifest,manifest_fingerprint,source_identity,destination_identity,attempts,created_at,updated_at,verified_at,last_error,cache_state,cache_operation,cache_updated_at,cache_error)
+ VALUES ('example','replicated',?,'fingerprint','source','destination',2,?,?,?,'','evicted','',?,'')`, manifest, verified, verified, verified, verified)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(context.Background(), path, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var state, stored, at, cache string
+	var attempts int
+	if err := db.QueryRow("SELECT state,manifest,verified_at,cache_state,attempts FROM replications WHERE hash='example'").Scan(&state, &stored, &at, &cache, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if state != "replicated" || stored != manifest || at != verified || cache != "evicted" || attempts != 2 {
+		t.Fatal("verified record changed during adoption migration")
+	}
+	if err := assertAppliedMigration(db, 4); err != nil {
+		t.Fatal(err)
+	}
 }

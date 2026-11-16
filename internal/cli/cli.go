@@ -48,6 +48,7 @@ func New(version string, runDaemon func(context.Context, string) error) *cobra.C
 	root.AddCommand(newTransfersCommand(opts))
 	root.AddCommand(newSyncCommand(opts))
 	root.AddCommand(newRetryCommand(opts))
+	root.AddCommand(newAdoptCommand(opts))
 	root.AddCommand(newEvictCommand(opts))
 	root.AddCommand(newCacheActionCommand(opts, "restore"))
 	root.AddCommand(newVersionCommand(version, opts))
@@ -372,14 +373,16 @@ func (c *apiClient) endpoint(path string) (string, error) {
 	if (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" {
 		return "", fmt.Errorf("invalid API server URL %q: expected an http(s) URL without credentials, query, or fragment", c.baseURL)
 	}
-	decodedPath, err := url.PathUnescape(path)
+	requestPath, query, _ := strings.Cut(path, "?")
+	decodedPath, err := url.PathUnescape(requestPath)
 	if err != nil {
 		return "", fmt.Errorf("invalid API path %q: %w", path, err)
 	}
 	basePath := strings.TrimRight(base.Path, "/")
 	escapedBasePath := strings.TrimRight(base.EscapedPath(), "/")
 	base.Path = basePath + decodedPath
-	base.RawPath = escapedBasePath + path
+	base.RawPath = escapedBasePath + requestPath
+	base.RawQuery = query
 	return base.String(), nil
 }
 
@@ -436,6 +439,10 @@ func writeStatus(writer io.Writer, status api.Status) error {
 	summary := status.Replication
 	_, err = fmt.Fprintf(writer, "Replication: %d pending, %d active, %d replicated, %d failed/blocked\n",
 		summary.Pending, summary.Active, summary.Replicated, summary.Failed+summary.Blocked)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(writer, "Adopted (unverified): %d\n", summary.Adopted)
 	return err
 }
 
@@ -504,13 +511,13 @@ func writeTorrents(writer io.Writer, torrents []api.Torrent) error {
 		return err
 	}
 	w := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(w, "NAME\tSIZE\tPROGRESS\tRATIO\tSTATE\tCACHE\tHASH"); err != nil {
+	if _, err := fmt.Fprintln(w, "NAME\tSIZE\tPROGRESS\tRATIO\tSTATE\tCACHE\tREPLICATION\tHASH"); err != nil {
 		return err
 	}
 	for _, torrent := range torrents {
-		if _, err := fmt.Fprintf(w, "%s\t%s\t%.1f%%\t%.2f\t%s\t%s\t%s\n",
+		if _, err := fmt.Fprintf(w, "%s\t%s\t%.1f%%\t%.2f\t%s\t%s\t%s\t%s\n",
 			cleanCell(torrent.Name), humanize.Bytes(uint64(max(torrent.TotalSize, int64(0)))), torrent.Progress*100,
-			torrent.Ratio, cleanCell(torrent.State), cleanCell(string(torrent.CacheState)), cleanCell(torrent.Hash)); err != nil {
+			torrent.Ratio, cleanCell(torrent.State), cleanCell(string(torrent.CacheState)), cleanCell(string(torrent.ReplicationState)), cleanCell(torrent.Hash)); err != nil {
 			return err
 		}
 	}
@@ -519,6 +526,9 @@ func writeTorrents(writer io.Writer, torrents []api.Torrent) error {
 
 func writeTorrentDetail(writer io.Writer, detail api.TorrentDetail) error {
 	t := detail.Torrent
+	if _, err := fmt.Fprintf(writer, "Replication: %s\nVerified: %s\n", t.ReplicationState, displayTime(t.VerifiedAt)); err != nil {
+		return err
+	}
 	if _, err := fmt.Fprintf(writer, "Cache: %s\nCache error: %s\n", t.CacheState, cleanCell(t.CacheError)); err != nil {
 		return err
 	}

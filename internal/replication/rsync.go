@@ -34,7 +34,7 @@ func NewRunner(source config.SourceConfig, destination config.DestinationConfig)
 	return &Runner{source: source, destination: destination}
 }
 
-func (r *Runner) Transfer(ctx context.Context, manifest Manifest) error {
+func (r *Runner) transfer(ctx context.Context, manifest Manifest) error {
 	files, _, err := validateManifest(manifest)
 	if err != nil {
 		return err
@@ -64,7 +64,7 @@ func (r *Runner) Transfer(ctx context.Context, manifest Manifest) error {
 	return nil
 }
 
-func (r *Runner) Verify(ctx context.Context, manifest Manifest) error {
+func (r *Runner) verify(ctx context.Context, manifest Manifest) error {
 	files, _, err := validateManifest(manifest)
 	if err != nil {
 		return err
@@ -119,7 +119,7 @@ func (r *Runner) Verify(ctx context.Context, manifest Manifest) error {
 // DestinationAvailable confirms that every manifest file still exists on the
 // destination as a regular file with its recorded size. It intentionally does
 // not hash the remote payload.
-func (r *Runner) DestinationAvailable(ctx context.Context, manifest Manifest) error {
+func (r *Runner) destinationAvailable(ctx context.Context, manifest Manifest) error {
 	files, _, err := validateManifest(manifest)
 	if err != nil {
 		return err
@@ -134,7 +134,7 @@ func (r *Runner) DestinationAvailable(ctx context.Context, manifest Manifest) er
 	}
 	for index, found := range available {
 		if !found {
-			return &BlockedError{Reason: fmt.Sprintf("destination payload %q is missing or has an unexpected size", files[index].Path)}
+			return &RemotePayloadError{Path: files[index].Path}
 		}
 	}
 	return nil
@@ -143,7 +143,7 @@ func (r *Runner) DestinationAvailable(ctx context.Context, manifest Manifest) er
 // Restore copies only manifest-listed files from the destination to the source.
 // Existing source files are left untouched, and mismatching files block the
 // operation before rsync starts.
-func (r *Runner) Restore(ctx context.Context, manifest Manifest) error {
+func (r *Runner) restore(ctx context.Context, manifest Manifest) error {
 	files, _, err := validateManifest(manifest)
 	if err != nil {
 		return err
@@ -200,7 +200,7 @@ func (r *Runner) Restore(ctx context.Context, manifest Manifest) error {
 
 // VerifyRestored compares destination content to the restored source files with
 // rsync checksums, without modifying either side.
-func (r *Runner) VerifyRestored(ctx context.Context, manifest Manifest) error {
+func (r *Runner) verifyRestored(ctx context.Context, manifest Manifest) error {
 	files, _, err := validateManifest(manifest)
 	if err != nil {
 		return err

@@ -33,6 +33,7 @@ const (
 	StateTransferring State = "transferring"
 	StateVerifying    State = "verifying"
 	StateReplicated   State = "replicated"
+	StateAdopted      State = "adopted"
 	StateFailed       State = "failed"
 	StateBlocked      State = "blocked"
 )
@@ -104,6 +105,14 @@ type Summary struct {
 	Transferring int `json:"transferring"`
 	Verifying    int `json:"verifying"`
 	Replicated   int `json:"replicated"`
+	Adopted      int `json:"adopted"`
 	Failed       int `json:"failed"`
 	Blocked      int `json:"blocked"`
 }
+
+type RemotePayloadError struct{ Path string }
+
+func (e *RemotePayloadError) Error() string {
+	return fmt.Sprintf("destination payload %q is missing or has an unexpected size", e.Path)
+}
+func (e *RemotePayloadError) Unwrap() error { return &BlockedError{Reason: e.Error()} }

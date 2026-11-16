@@ -42,8 +42,9 @@ type SourceConfig struct {
 }
 
 type DestinationConfig struct {
-	SSHTarget string `yaml:"ssh_target"`
-	BasePath  string `yaml:"base_path"`
+	SSHTarget    string            `yaml:"ssh_target"`
+	BasePath     string            `yaml:"base_path"`
+	PathMappings map[string]string `yaml:"path_mappings"`
 }
 
 func (c Config) ReplicationEnabled() bool {
@@ -200,7 +201,10 @@ func validate(cfg Config) error {
 }
 
 func validateReplication(cfg Config) error {
-	if cfg.Source == (SourceConfig{}) && cfg.Destination == (DestinationConfig{}) {
+	if err := ValidatePathMappings(cfg.Destination.PathMappings); err != nil {
+		return err
+	}
+	if cfg.Source == (SourceConfig{}) && cfg.Destination.SSHTarget == "" && cfg.Destination.BasePath == "" && len(cfg.Destination.PathMappings) == 0 {
 		return nil
 	}
 	if !cfg.ReplicationEnabled() {

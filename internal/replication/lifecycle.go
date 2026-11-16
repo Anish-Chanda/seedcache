@@ -20,12 +20,19 @@ import (
 const seedStateWaitLimit = 30 * time.Second
 
 func (e *Engine) Evict(ctx context.Context, hash string) (Record, error) {
+	if err := e.acquireCatalog(ctx); err != nil {
+		return Record{}, err
+	}
+	defer e.releaseCatalog()
 	normalized, err := normalizeHash(hash)
 	if err != nil {
 		return Record{}, err
 	}
 	if !validLifecycleHash(normalized) {
 		return Record{}, fmt.Errorf("%w: torrent hash must be 40 or 64 hexadecimal characters", ErrConflict)
+	}
+	if e.adoptionReservations[normalized] > 0 {
+		return Record{}, fmt.Errorf("%w: torrent is reserved for adoption", ErrConflict)
 	}
 	record, err := e.repository.get(ctx, normalized)
 	if err != nil {
@@ -61,6 +68,10 @@ func (e *Engine) Evict(ctx context.Context, hash string) (Record, error) {
 }
 
 func (e *Engine) Restore(ctx context.Context, hash string) (Record, error) {
+	if err := e.acquireCatalog(ctx); err != nil {
+		return Record{}, err
+	}
+	defer e.releaseCatalog()
 	normalized, err := normalizeHash(hash)
 	if err != nil {
 		return Record{}, err
@@ -68,11 +79,14 @@ func (e *Engine) Restore(ctx context.Context, hash string) (Record, error) {
 	if !validLifecycleHash(normalized) {
 		return Record{}, fmt.Errorf("%w: torrent hash must be 40 or 64 hexadecimal characters", ErrConflict)
 	}
+	if e.adoptionReservations[normalized] > 0 {
+		return Record{}, fmt.Errorf("%w: torrent is reserved for adoption", ErrConflict)
+	}
 	record, err := e.repository.get(ctx, normalized)
 	if err != nil {
 		return Record{}, err
 	}
-	if err := requireVerifiedRecord(record, e); err != nil {
+	if err := requireRestorableRecord(record, e); err != nil {
 		return record, err
 	}
 	e.mu.Lock()
@@ -91,7 +105,7 @@ func (e *Engine) Restore(ctx context.Context, hash string) (Record, error) {
 		return e.persistQueuedCacheOperation(ctx, record, updated, "seeding retry requested")
 	}
 	if record.CacheOperation == CacheOperationRestore &&
-		(record.CacheState == CacheEvicted || record.CacheState == CacheRestoring) {
+		(record.CacheState == CacheEvicted || record.CacheState == CacheRestoring || (record.State == StateAdopted && record.CacheState == CachePresent)) {
 		if record.CacheError == "" {
 			return record, nil
 		}
@@ -100,8 +114,8 @@ func (e *Engine) Restore(ctx context.Context, hash string) (Record, error) {
 		updated.CacheUpdatedAt = time.Now().UTC()
 		return e.persistQueuedCacheOperation(ctx, record, updated, "restoration retry requested")
 	}
-	if record.CacheState != CacheEvicted || record.CacheOperation != "" {
-		return record, fmt.Errorf("%w: torrent cache state is %s; only evicted torrents can be restored", ErrConflict, cacheDescription(record))
+	if (record.CacheState != CacheEvicted && !(record.State == StateAdopted && record.CacheState == CachePresent)) || record.CacheOperation != "" {
+		return record, fmt.Errorf("%w: torrent cache state is %s; only evicted or adopted torrents can be restored", ErrConflict, cacheDescription(record))
 	}
 	updated := record
 	updated.CacheOperation = CacheOperationRestore
@@ -309,11 +323,11 @@ func (e *Engine) runEviction(ctx context.Context, record Record) error {
 }
 
 func (e *Engine) runRestoration(ctx context.Context, record Record) error {
-	if err := requireVerifiedRecord(record, e); err != nil {
+	if err := requireRestorableRecord(record, e); err != nil {
 		return err
 	}
 	if record.CacheOperation != CacheOperationRestore ||
-		(record.CacheState != CacheEvicted && record.CacheState != CacheRestoring) {
+		(record.CacheState != CacheEvicted && record.CacheState != CacheRestoring && !(record.State == StateAdopted && record.CacheState == CachePresent)) {
 		return fmt.Errorf("%w: restoration operation has an unexpected cache state", ErrConflict)
 	}
 	recovering := record.CacheState == CacheRestoring
@@ -393,13 +407,10 @@ func (e *Engine) runRestoration(ctx context.Context, record Record) error {
 		return err
 	}
 	e.log.Info().Str("hash", record.Hash).Msg("torrent recheck completed")
-	_, err = e.updateCacheCurrent(record.Hash, func(updated *Record) {
-		updated.CacheState = CachePresent
-		updated.CacheOperation = CacheOperationSeed
-		updated.CacheError = ""
-		updated.CacheUpdatedAt = time.Now().UTC()
-		updated.RestoredAt = ptrTime(updated.CacheUpdatedAt)
-	})
+	persistCtx, persistCancel := persistenceContext()
+	defer persistCancel()
+	err = e.repository.completeRestoration(persistCtx, record.Hash, time.Now().UTC())
+	e.signal()
 	return err
 }
 
@@ -487,34 +498,42 @@ func (e *Engine) requireTorrentStopped(ctx context.Context, hash string) error {
 }
 
 func (e *Engine) fetchLifecycleManifest(ctx context.Context, hash string) (qbittorrent.Torrent, Manifest, error) {
+	torrent, manifest, _, err := e.fetchLifecyclePayload(ctx, hash)
+	return torrent, manifest, err
+}
+
+func (e *Engine) fetchLifecyclePayload(ctx context.Context, hash string) (qbittorrent.Torrent, Manifest, []qbittorrent.File, error) {
 	torrent, err := e.client.Torrent(ctx, hash)
 	if err != nil {
 		if errors.Is(err, qbittorrent.ErrNotFound) {
-			return qbittorrent.Torrent{}, Manifest{}, fmt.Errorf("%w: torrent not found in qBittorrent", ErrNotFound)
+			return qbittorrent.Torrent{}, Manifest{}, nil, fmt.Errorf("%w: torrent not found in qBittorrent", ErrNotFound)
 		}
 		if !errors.Is(err, context.Canceled) {
 			e.Unavailable()
 		}
-		return qbittorrent.Torrent{}, Manifest{}, fmt.Errorf("qBittorrent torrent lookup: %w", err)
+		return qbittorrent.Torrent{}, Manifest{}, nil, fmt.Errorf("qBittorrent torrent lookup: %w", err)
 	}
 	files, err := e.client.Files(ctx, hash)
 	if err != nil {
 		if errors.Is(err, qbittorrent.ErrNotFound) {
-			return torrent, Manifest{}, fmt.Errorf("%w: torrent files not found in qBittorrent", ErrNotFound)
+			return torrent, Manifest{}, nil, fmt.Errorf("%w: torrent files not found in qBittorrent", ErrNotFound)
 		}
 		if !errors.Is(err, context.Canceled) {
 			e.Unavailable()
 		}
-		return torrent, Manifest{}, fmt.Errorf("qBittorrent file list: %w", err)
+		return torrent, Manifest{}, nil, fmt.Errorf("qBittorrent file list: %w", err)
 	}
 	manifest, err := manifestFromTorrentMetadata(torrent, files, e.source)
 	if err != nil {
-		return torrent, Manifest{}, err
+		return torrent, Manifest{}, nil, err
 	}
-	return torrent, manifest, nil
+	return torrent, manifest, files, nil
 }
 
 func manifestFromTorrentMetadata(torrent qbittorrent.Torrent, files []qbittorrent.File, source config.SourceConfig) (Manifest, error) {
+	if torrent.Size < 0 || torrent.TotalSize < 0 {
+		return Manifest{}, &BlockedError{Reason: "qBittorrent returned invalid torrent sizes"}
+	}
 	if torrent.AutoTMM {
 		return Manifest{}, &BlockedError{Reason: "automatic torrent management is enabled"}
 	}
@@ -543,16 +562,16 @@ func manifestFromTorrentMetadata(torrent qbittorrent.Torrent, files []qbittorren
 	seenIndexes := make(map[int]struct{}, len(files))
 	seenPaths := make(map[string]struct{}, len(files))
 	for _, file := range files {
-		if file.Priority < 0 || file.Size < 0 || file.Index < 0 {
+		if file.Priority < 0 || file.Size < 0 || file.Index < 0 || !isFinite(file.Progress) || file.Progress < 0 || file.Progress > 1 {
 			return Manifest{}, &BlockedError{Reason: fmt.Sprintf("qBittorrent returned invalid file metadata for %q", file.Name)}
-		}
-		if file.Priority == 0 {
-			continue
 		}
 		if _, exists := seenIndexes[file.Index]; exists {
 			return Manifest{}, &BlockedError{Reason: fmt.Sprintf("qBittorrent returned duplicate file index %d", file.Index)}
 		}
 		seenIndexes[file.Index] = struct{}{}
+		if file.Priority == 0 {
+			continue
+		}
 		name, err := cleanRelativePath(file.Name, "qBittorrent file name")
 		if err != nil {
 			return Manifest{}, &BlockedError{Reason: err.Error()}
@@ -1137,7 +1156,14 @@ func (e *Engine) queueAutomaticEviction(ctx context.Context) (bool, error) {
 	}
 	e.retentionExhaustedLogged = false
 	e.mu.Unlock()
+	if err := e.acquireCatalog(ctx); err != nil {
+		return false, err
+	}
+	defer e.releaseCatalog()
 	for _, candidate := range plan.Candidates {
+		if e.adoptionReservations[candidate.Hash] > 0 {
+			continue
+		}
 		record, err := e.repository.get(ctx, candidate.Hash)
 		if err != nil {
 			if errors.Is(err, ErrNotFound) {
@@ -1206,4 +1232,17 @@ func (e *Engine) reconcileEvictedTorrents(ctx context.Context, torrents []qbitto
 		e.log.Warn().Str("hash", hash).Msg("stopped unexpectedly started evicted torrent")
 		e.cacheGuardMu.Unlock()
 	}
+}
+
+func requireRestorableRecord(record Record, e *Engine) error {
+	if record.State == StateAdopted {
+		if record.VerifiedAt != nil || record.ManifestFingerprint == "" || record.ManifestFingerprint != record.Manifest.Fingerprint() || e.identityMismatch(record) {
+			return fmt.Errorf("%w: adopted manifest or storage identity changed", ErrConflict)
+		}
+		if _, _, err := validateManifest(record.Manifest); err != nil {
+			return err
+		}
+		return nil
+	}
+	return requireVerifiedRecord(record, e)
 }

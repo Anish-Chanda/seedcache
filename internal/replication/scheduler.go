@@ -3,6 +3,7 @@ package replication
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -38,6 +39,8 @@ type Engine struct {
 	wake        chan struct{}
 	retention   config.RetentionConfig
 
+	catalog                  chan struct{}
+	adoptionReservations     map[string]int
 	mu                       sync.Mutex
 	cacheGuardMu             sync.Mutex
 	connected                bool
@@ -60,14 +63,16 @@ func NewEngine(db *sql.DB, client *qbittorrent.Client, source config.SourceConfi
 		return nil, errors.New("qBittorrent client is required")
 	}
 	return &Engine{
-		repository:  &repository{db: db},
-		client:      client,
-		source:      source,
-		destination: destination,
-		runner:      NewRunner(source, destination),
-		log:         log,
-		wake:        make(chan struct{}, 1),
-		snapshot:    make(map[string]qbittorrent.Torrent),
+		repository:           &repository{db: db},
+		client:               client,
+		source:               source,
+		destination:          destination,
+		runner:               NewRunner(source, destination),
+		log:                  log,
+		wake:                 make(chan struct{}, 1),
+		catalog:              make(chan struct{}, 1),
+		adoptionReservations: make(map[string]int),
+		snapshot:             make(map[string]qbittorrent.Torrent),
 	}, nil
 }
 
@@ -112,9 +117,16 @@ func (e *Engine) ConfigureRetention(retention config.RetentionConfig) {
 // Queue captures torrent metadata and stores a pending record. Transfers are
 // started only by Run, outside the caller's request.
 func (e *Engine) Queue(ctx context.Context, hash string) (Record, error) {
+	if err := e.acquireCatalog(ctx); err != nil {
+		return Record{}, err
+	}
+	defer e.releaseCatalog()
 	normalized, err := normalizeHash(hash)
 	if err != nil {
 		return Record{}, err
+	}
+	if e.adoptionReservations[normalized] > 0 {
+		return Record{}, fmt.Errorf("%w: torrent is reserved for adoption", ErrConflict)
 	}
 	current, err := e.repository.get(ctx, normalized)
 	if err == nil {
@@ -133,6 +145,8 @@ func (e *Engine) Queue(ctx context.Context, hash string) (Record, error) {
 				return Record{}, blockErr
 			}
 			return blocked, &BlockedError{Reason: blocked.LastError}
+		case StateAdopted:
+			return current, fmt.Errorf("%w: adopted content must be restored and rechecked before replication", ErrConflict)
 		case StateFailed, StateBlocked:
 			return current, fmt.Errorf("%w: use retry for a %s replication", ErrConflict, current.State)
 		}
@@ -167,9 +181,16 @@ func (e *Engine) Queue(ctx context.Context, hash string) (Record, error) {
 }
 
 func (e *Engine) Retry(ctx context.Context, hash string) (Record, error) {
+	if err := e.acquireCatalog(ctx); err != nil {
+		return Record{}, err
+	}
+	defer e.releaseCatalog()
 	normalized, err := normalizeHash(hash)
 	if err != nil {
 		return Record{}, err
+	}
+	if e.adoptionReservations[normalized] > 0 {
+		return Record{}, fmt.Errorf("%w: torrent is reserved for adoption", ErrConflict)
 	}
 	current, err := e.repository.get(ctx, normalized)
 	if err != nil {
@@ -227,6 +248,10 @@ func (e *Engine) Retry(ctx context.Context, hash string) (Record, error) {
 // Reconcile applies a successful discovery snapshot and queues newly completed
 // torrents. It inspects file manifests only for new candidates and active work.
 func (e *Engine) Reconcile(ctx context.Context, torrents []qbittorrent.Torrent) error {
+	if err := e.acquireCatalog(ctx); err != nil {
+		return err
+	}
+	defer e.releaseCatalog()
 	snapshot := make(map[string]qbittorrent.Torrent, len(torrents))
 	for _, torrent := range torrents {
 		if hash, err := normalizeHash(torrent.Hash); err == nil {
@@ -252,6 +277,9 @@ func (e *Engine) Reconcile(ctx context.Context, torrents []qbittorrent.Torrent) 
 	}
 
 	for hash, torrent := range snapshot {
+		if e.adoptionReservations[hash] > 0 {
+			continue
+		}
 		if !potentiallyComplete(torrent) {
 			continue
 		}
@@ -330,9 +358,19 @@ func (e *Engine) Run(ctx context.Context) error {
 		connected := e.connected
 		e.mu.Unlock()
 		if connected {
+			if err := e.acquireCatalog(ctx); err != nil {
+				return nil
+			}
 			dbCtx, cancel := persistenceContext()
-			operation, found, err := e.repository.nextCacheOperation(dbCtx)
+			operation, found, err := e.repository.nextCacheOperation(dbCtx, e.reservedAdoptionHashes()...)
 			cancel()
+			if err == nil && found {
+				e.mu.Lock()
+				e.activeCacheHash = operation.Hash
+				e.activeCacheOperation = operation.CacheOperation
+				e.mu.Unlock()
+			}
+			e.releaseCatalog()
 			if err != nil {
 				return err
 			}
@@ -352,19 +390,21 @@ func (e *Engine) Run(ctx context.Context) error {
 			if queued {
 				continue
 			}
+			if err := e.acquireCatalog(ctx); err != nil {
+				return nil
+			}
 			dbCtx, cancel = persistenceContext()
-			record, found, err := e.repository.nextReady(dbCtx, time.Now().UTC())
+			record, found, err := e.repository.nextReady(dbCtx, time.Now().UTC(), e.reservedAdoptionHashes()...)
 			cancel()
 			if err != nil {
+				e.releaseCatalog()
 				return err
 			}
 			if found {
-				if record.CacheState != CachePresent || record.CacheOperation != "" {
-					continue
-				}
 				dbCtx, cancel = persistenceContext()
 				started, ok, err := e.repository.start(dbCtx, record.Hash, time.Now().UTC())
 				cancel()
+				e.releaseCatalog()
 				if err != nil {
 					return err
 				}
@@ -374,14 +414,20 @@ func (e *Engine) Run(ctx context.Context) error {
 					}
 					continue
 				}
+			} else {
+				e.releaseCatalog()
 			}
 		}
 
 		wait := time.Minute
 		if connected {
+			if err := e.acquireCatalog(ctx); err != nil {
+				return nil
+			}
 			waitCtx, waitCancel := persistenceContext()
-			due, err := e.repository.nextDue(waitCtx, time.Now().UTC())
+			due, err := e.repository.nextDue(waitCtx, time.Now().UTC(), e.reservedAdoptionHashes()...)
 			waitCancel()
+			e.releaseCatalog()
 			if err != nil {
 				return err
 			}
@@ -775,7 +821,12 @@ func (e *Engine) sourceIdentity() string {
 }
 
 func (e *Engine) destinationIdentity() string {
-	return fmt.Sprintf("%s:%q", e.destination.SSHTarget, e.destination.BasePath)
+	identity := fmt.Sprintf("%s:%q", e.destination.SSHTarget, e.destination.BasePath)
+	if len(e.destination.PathMappings) != 0 {
+		mappings, _ := json.Marshal(e.destination.PathMappings)
+		identity += " " + string(mappings)
+	}
+	return identity
 }
 
 func (e *Engine) signal() {

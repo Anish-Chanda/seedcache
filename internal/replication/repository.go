@@ -63,6 +63,8 @@ func (r *repository) summary(ctx context.Context) (Summary, error) {
 		case StateVerifying:
 			result.Verifying = count
 			result.Active += count
+		case StateAdopted:
+			result.Adopted = count
 		case StateReplicated:
 			result.Replicated = count
 		case StateFailed:
@@ -166,9 +168,10 @@ func (r *repository) replaceCache(ctx context.Context, expected, updated Record)
 	return changed != 0, nil
 }
 
-func (r *repository) nextCacheOperation(ctx context.Context) (Record, bool, error) {
-	record, err := scanRecord(r.db.QueryRowContext(ctx, selectRecordSQL+` WHERE cache_operation <> '' AND cache_error = ''
-		ORDER BY cache_updated_at, hash LIMIT 1`))
+func (r *repository) nextCacheOperation(ctx context.Context, excluded ...string) (Record, bool, error) {
+	clause, args := excludeAdoptionHashes(excluded)
+	record, err := scanRecord(r.db.QueryRowContext(ctx, selectRecordSQL+` WHERE cache_operation <> '' AND cache_error = ''`+clause+`
+		ORDER BY cache_updated_at, hash LIMIT 1`, args...))
 	if errors.Is(err, ErrNotFound) {
 		return Record{}, false, nil
 	}
@@ -208,10 +211,13 @@ func (r *repository) start(ctx context.Context, hash string, now time.Time) (Rec
 	return record, true, err
 }
 
-func (r *repository) nextReady(ctx context.Context, now time.Time) (Record, bool, error) {
+func (r *repository) nextReady(ctx context.Context, now time.Time, excluded ...string) (Record, bool, error) {
+	clause, excludedArgs := excludeAdoptionHashes(excluded)
+	args := []any{CachePresent, StatePending, StateFailed, formatTime(now)}
+	args = append(args, excludedArgs...)
 	record, err := scanRecord(r.db.QueryRowContext(ctx, selectRecordSQL+` WHERE cache_state = ? AND cache_operation = '' AND (state = ? OR
-		(state = ? AND (next_attempt_at IS NULL OR next_attempt_at <= ?)))
-		ORDER BY created_at, hash LIMIT 1`, CachePresent, StatePending, StateFailed, formatTime(now)))
+		(state = ? AND (next_attempt_at IS NULL OR next_attempt_at <= ?)))`+clause+`
+		ORDER BY created_at, hash LIMIT 1`, args...))
 	if errors.Is(err, ErrNotFound) {
 		return Record{}, false, nil
 	}
@@ -221,12 +227,14 @@ func (r *repository) nextReady(ctx context.Context, now time.Time) (Record, bool
 	return record, true, nil
 }
 
-func (r *repository) nextDue(ctx context.Context, now time.Time) (*time.Time, error) {
+func (r *repository) nextDue(ctx context.Context, now time.Time, excluded ...string) (*time.Time, error) {
 	var due sql.NullString
+	clause, excludedArgs := excludeAdoptionHashes(excluded)
+	args := []any{StatePending, formatTime(now), CachePresent, StatePending, StateFailed}
+	args = append(args, excludedArgs...)
 	err := r.db.QueryRowContext(ctx, `SELECT MIN(CASE
 		WHEN state = ? THEN ? ELSE next_attempt_at END)
-		FROM replications WHERE cache_state = ? AND cache_operation = '' AND (state = ? OR state = ?)`,
-		StatePending, formatTime(now), CachePresent, StatePending, StateFailed).Scan(&due)
+		FROM replications WHERE cache_state = ? AND cache_operation = '' AND (state = ? OR state = ?)`+clause, args...).Scan(&due)
 	if err != nil {
 		return nil, fmt.Errorf("read next replication retry: %w", err)
 	}
@@ -338,4 +346,73 @@ func parseNullableTime(value sql.NullString) (*time.Time, error) {
 		return nil, err
 	}
 	return &parsed, nil
+}
+
+func (r *repository) adopt(ctx context.Context, expected, adopted Record) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	current, err := scanRecord(tx.QueryRowContext(ctx, selectRecordSQL+" WHERE hash = ?", adopted.Hash))
+	if expected.Hash == "" {
+		if !errors.Is(err, ErrNotFound) {
+			if err != nil {
+				return err
+			}
+			return ErrConflict
+		}
+	} else {
+		if err != nil {
+			return err
+		}
+		if current.State != expected.State || current.UpdatedAt != expected.UpdatedAt || current.CacheState != expected.CacheState || current.CacheOperation != expected.CacheOperation || current.CacheUpdatedAt != expected.CacheUpdatedAt || current.VerifiedAt != nil {
+			return ErrConflict
+		}
+		if _, err := tx.ExecContext(ctx, "DELETE FROM replications WHERE hash = ?", adopted.Hash); err != nil {
+			return err
+		}
+	}
+	manifest, err := marshalManifest(adopted.Manifest)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO replications
+ (hash,state,manifest,manifest_fingerprint,source_identity,destination_identity,attempts,created_at,updated_at,last_error,cache_state,cache_operation,cache_updated_at,cache_error)
+ VALUES(?,?,?,?,?,?,?,?,?,'',?,'',?,'')`, adopted.Hash, StateAdopted, manifest, adopted.ManifestFingerprint, adopted.SourceIdentity, adopted.DestinationIdentity, adopted.Attempts, formatTime(adopted.CreatedAt), formatTime(adopted.UpdatedAt), adopted.CacheState, formatTime(adopted.CacheUpdatedAt))
+	if err != nil {
+		return fmt.Errorf("persist adoption: %w", err)
+	}
+	return tx.Commit()
+}
+
+func (r *repository) completeRestoration(ctx context.Context, hash string, now time.Time) error {
+	result, err := r.db.ExecContext(ctx, `UPDATE replications SET state = ?, verified_at = ?, updated_at = ?,
+ cache_state = ?, cache_operation = ?, cache_error = '', cache_updated_at = ?, restored_at = ?
+ WHERE hash = ? AND state IN (?,?) AND cache_state = ? AND cache_operation = ?`,
+		StateReplicated, formatTime(now), formatTime(now), CachePresent, CacheOperationSeed, formatTime(now), formatTime(now), hash, StateAdopted, StateReplicated, CacheRestoring, CacheOperationRestore)
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return ErrConflict
+	}
+	return nil
+}
+
+func excludeAdoptionHashes(hashes []string) (string, []any) {
+	if len(hashes) == 0 {
+		return "", nil
+	}
+	placeholders := make([]string, len(hashes))
+	args := make([]any, len(hashes))
+	for i, hash := range hashes {
+		placeholders[i] = "?"
+		args[i] = hash
+	}
+	return " AND hash NOT IN (" + strings.Join(placeholders, ",") + ")", args
 }
