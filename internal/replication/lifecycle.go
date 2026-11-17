@@ -331,7 +331,7 @@ func (e *Engine) runRestoration(ctx context.Context, record Record) error {
 		return fmt.Errorf("%w: restoration operation has an unexpected cache state", ErrConflict)
 	}
 	recovering := record.CacheState == CacheRestoring
-	_, manifest, err := e.fetchLifecycleManifest(ctx, record.Hash)
+	torrent, manifest, err := e.fetchLifecycleManifest(ctx, record.Hash)
 	if err != nil {
 		return err
 	}
@@ -387,6 +387,20 @@ func (e *Engine) runRestoration(ctx context.Context, record Record) error {
 	}
 	if err := e.runner.VerifyRestored(ctx, record.Manifest); err != nil {
 		return fmt.Errorf("verify restored payload: %w", err)
+	}
+	// Stage an absent part-file away from the live path. An administrator
+	// must install it while qBittorrent is stopped, then restart qBittorrent
+	// so libtorrent can rebuild its cached part-file piece map.
+	if partFiles, ok := e.runner.(interface {
+		StagePartFile(context.Context, string, string, Manifest) (bool, error)
+	}); ok {
+		staged, err := partFiles.StagePartFile(ctx, record.Hash, torrent.SavePath, record.Manifest)
+		if err != nil {
+			return fmt.Errorf("restore qBittorrent part-file: %w", err)
+		}
+		if staged {
+			return &BlockedError{Reason: "qBittorrent part-file staged separately; stop qBittorrent, install the staged .parts file in its save directory, restart qBittorrent, then retry restoration"}
+		}
 	}
 	e.log.Info().Str("hash", record.Hash).Msg("restoration verified")
 	e.cacheGuardMu.Lock()
@@ -607,14 +621,8 @@ func manifestFromTorrentMetadata(torrent qbittorrent.Torrent, files []qbittorren
 	if len(manifest.Files) == 0 {
 		return Manifest{}, &BlockedError{Reason: "torrent has no selected files"}
 	}
-	if torrent.Size > 0 && torrent.Size != manifest.TotalSize {
-		// A migrated missingFiles torrent can report the full torrent size
-		// even when qBittorrent marks some files as skipped. Accept only
-		// when the full size is independently corroborated by every file.
-		if torrent.Size != torrent.TotalSize || torrent.TotalSize != allFilesSize ||
-			manifest.TotalSize >= allFilesSize {
-			return Manifest{}, &BlockedError{Reason: "qBittorrent selected size does not match its file list"}
-		}
+	if torrent.Size > 0 && !consistentSelectedSize(torrent, manifest.TotalSize, allFilesSize, manifest.TotalSize < allFilesSize) {
+		return Manifest{}, &BlockedError{Reason: "qBittorrent selected size does not match its file list"}
 	}
 	sort.Slice(manifest.Files, func(i, j int) bool {
 		if manifest.Files[i].Path != manifest.Files[j].Path {

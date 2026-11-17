@@ -27,10 +27,14 @@ func TestRemoveManifestFilesDeletesOnlyListedPayload(t *testing.T) {
 	}
 	selected := filepath.Join(payloadDir, "selected.bin")
 	unrelated := filepath.Join(payloadDir, "unrelated.txt")
+	partFile := filepath.Join(payloadDir, "."+strings.Repeat("a", 40)+".parts")
 	if err := os.WriteFile(selected, []byte("selected"), 0o640); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(unrelated, []byte("keep"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(partFile, []byte("boundary"), 0o660); err != nil {
 		t.Fatal(err)
 	}
 	source := config.SourceConfig{QBittorrentBasePath: "/downloads", LocalBasePath: root}
@@ -44,6 +48,9 @@ func TestRemoveManifestFilesDeletesOnlyListedPayload(t *testing.T) {
 	}
 	if contents, err := os.ReadFile(unrelated); err != nil || string(contents) != "keep" {
 		t.Fatalf("unrelated file changed: contents=%q err=%v", contents, err)
+	}
+	if contents, err := os.ReadFile(partFile); err != nil || string(contents) != "boundary" {
+		t.Fatalf("part-file removed or changed by eviction")
 	}
 	if info, err := os.Stat(payloadDir); err != nil || !info.IsDir() {
 		t.Fatalf("containing directory was removed or changed: info=%v err=%v", info, err)
@@ -141,6 +148,26 @@ func TestManifestFromTorrentMetadataAcceptsFullSizeWithSkippedFiles(t *testing.T
 	}
 }
 
+func TestManifestFromTorrentMetadataAcceptsPieceAccountedSelectedBytes(t *testing.T) {
+	root := t.TempDir()
+	source := config.SourceConfig{QBittorrentBasePath: "/downloads", LocalBasePath: root}
+	files := []qbittorrent.File{
+		{Index: 0, Name: "bundle/video.bin", Size: 5, Priority: 1, Progress: 0},
+		{Index: 1, Name: "bundle/skipped.txt", Size: 4, Priority: 0, Progress: 0},
+	}
+	torrent := qbittorrent.Torrent{
+		State: "missingFiles", Size: 8, TotalSize: 9,
+		SavePath: "/downloads", ContentPath: "/downloads/bundle",
+	}
+	manifest, err := manifestFromTorrentMetadata(torrent, files, source)
+	if err != nil {
+		t.Fatalf("metadata manifest: %v", err)
+	}
+	if manifest.TotalSize != 5 || len(manifest.Files) != 1 {
+		t.Fatalf("manifest = %+v, want only selected file", manifest)
+	}
+}
+
 func TestManifestFromTorrentMetadataRejectsUnexplainedSizeMismatch(t *testing.T) {
 	root := t.TempDir()
 	source := config.SourceConfig{QBittorrentBasePath: "/downloads", LocalBasePath: root}
@@ -153,7 +180,7 @@ func TestManifestFromTorrentMetadataRejectsUnexplainedSizeMismatch(t *testing.T)
 		size      int64
 		totalSize int64
 	}{
-		{name: "unexpected selected size", size: 130, totalSize: 131},
+		{name: "size smaller than selected bytes", size: 99, totalSize: 131},
 		{name: "inconsistent full size", size: 132, totalSize: 132},
 		{name: "size not equal full size", size: 132, totalSize: 131},
 		{name: "missing total size", size: 131, totalSize: 0},

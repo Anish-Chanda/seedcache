@@ -527,6 +527,21 @@ func (e *Engine) runRecord(ctx context.Context, record Record) error {
 	if workCtx.Err() != nil {
 		return e.finishCanceled(record, ctx)
 	}
+	// Keep skipped-file boundary pieces recoverable after the payload is evicted.
+	// Auxiliary part-files remain separate from the selected-file manifest.
+	if partFiles, ok := e.runner.(interface {
+		BackupPartFile(context.Context, string, string) error
+	}); ok {
+		if err := partFiles.BackupPartFile(workCtx, record.Hash, torrent.SavePath); err != nil {
+			if workCtx.Err() != nil {
+				return e.finishCanceled(record, ctx)
+			}
+			if isBlocked(err) {
+				return e.blockRecord(record, err.Error())
+			}
+			return e.failRecord(record, err)
+		}
+	}
 	_, finalManifest, err := e.fetchManifest(workCtx, record.Hash)
 	if err != nil {
 		if isBlocked(err) || errors.Is(err, ErrIneligible) || errors.Is(err, qbittorrent.ErrNotFound) {

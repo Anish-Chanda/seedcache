@@ -39,7 +39,7 @@ func BuildManifest(torrent qbittorrent.Torrent, files []qbittorrent.File, source
 	if !readyTorrentState(torrent.State) {
 		return Manifest{}, fmt.Errorf("%w: qBittorrent state is %q", ErrIneligible, torrent.State)
 	}
-	if torrent.Size < 0 || torrent.AmountLeft != 0 || (torrent.Size > 0 && !completeProgress(torrent.Progress)) {
+	if torrent.Size < 0 || torrent.AmountLeft != 0 || !isFinite(torrent.Progress) || torrent.Progress < 0 || torrent.Progress > 1 {
 		return Manifest{}, fmt.Errorf("%w: qBittorrent still reports incomplete selected data", ErrIneligible)
 	}
 	if len(files) == 0 {
@@ -125,7 +125,23 @@ func BuildManifest(torrent qbittorrent.Torrent, files []qbittorrent.File, source
 	if len(manifest.Files) == 0 {
 		return Manifest{}, fmt.Errorf("%w: torrent has no selected files", ErrIneligible)
 	}
-	if torrent.Size < 0 || torrent.Size != manifest.TotalSize {
+	var allFilesSize int64
+	hasSkipped, validAllSizes := false, true
+	for _, file := range files {
+		if file.Priority == 0 {
+			hasSkipped = true
+		}
+		if file.Size < 0 || file.Size > math.MaxInt64-allFilesSize {
+			validAllSizes = false
+			continue
+		}
+		allFilesSize += file.Size
+	}
+	if !hasSkipped && torrent.Size > 0 && !completeProgress(torrent.Progress) {
+		return Manifest{}, fmt.Errorf("%w: qBittorrent still reports incomplete selected data", ErrIneligible)
+	}
+	if !validAllSizes && torrent.Size != manifest.TotalSize ||
+		(validAllSizes && !consistentSelectedSize(torrent, manifest.TotalSize, allFilesSize, hasSkipped)) {
 		return Manifest{}, fmt.Errorf("%w: qBittorrent selected size does not match its file list", ErrIneligible)
 	}
 	sort.Slice(manifest.Files, func(i, j int) bool {
@@ -135,6 +151,18 @@ func BuildManifest(torrent qbittorrent.Torrent, files []qbittorrent.File, source
 		return manifest.Files[i].Index < manifest.Files[j].Index
 	})
 	return manifest, nil
+}
+
+// qBittorrent's size field is piece-accounted for some partially selected
+// torrents. Shared pieces may contribute skipped-file bytes to size even when
+// the selected payload itself is byte-for-byte complete. The per-selected-file
+// progress checks and zero amount_left remain mandatory.
+func consistentSelectedSize(torrent qbittorrent.Torrent, selectedBytes, allBytes int64, hasSkipped bool) bool {
+	if torrent.Size == selectedBytes {
+		return true
+	}
+	return hasSkipped && torrent.TotalSize == allBytes &&
+		selectedBytes < torrent.Size && torrent.Size <= allBytes
 }
 
 func (m Manifest) Equal(other Manifest) bool {

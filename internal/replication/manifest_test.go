@@ -46,6 +46,66 @@ func TestBuildManifestMapsSelectedFilesAndIgnoresExcludedFiles(t *testing.T) {
 	}
 }
 
+func TestBuildManifestAcceptsVerifiedSelectedFilesWithSkippedPieceAccounting(t *testing.T) {
+	root := t.TempDir()
+	writePayload(t, root, "bundle/video.bin", []byte("video"))
+	source := config.SourceConfig{QBittorrentBasePath: "/downloads", LocalBasePath: root}
+	files := []qbittorrent.File{
+		{Index: 0, Name: "bundle/video.bin", Size: 5, Priority: 1, Progress: 1},
+		{Index: 1, Name: "bundle/description.txt", Size: 4, Priority: 0, Progress: 1},
+	}
+	torrent := qbittorrent.Torrent{
+		State: "stoppedUP", Progress: 0.999, AmountLeft: 0, Size: 8, TotalSize: 9,
+		SavePath: "/downloads", ContentPath: "/downloads/bundle",
+	}
+	for _, size := range []int64{5, 8, 9} {
+		torrent.Size = size
+		manifest, err := BuildManifest(torrent, files, source)
+		if err != nil {
+			t.Fatalf("size=%d: BuildManifest() error = %v", size, err)
+		}
+		if manifest.TotalSize != 5 || len(manifest.Files) != 1 {
+			t.Fatalf("size=%d: manifest = %+v, want one selected 5-byte file", size, manifest)
+		}
+	}
+}
+
+func TestBuildManifestRejectsInvalidPieceSizeAndIncompleteSelection(t *testing.T) {
+	root := t.TempDir()
+	writePayload(t, root, "bundle/video.bin", []byte("video"))
+	source := config.SourceConfig{QBittorrentBasePath: "/downloads", LocalBasePath: root}
+	files := []qbittorrent.File{
+		{Index: 0, Name: "bundle/video.bin", Size: 5, Priority: 1, Progress: 1},
+		{Index: 1, Name: "bundle/description.txt", Size: 4, Priority: 0, Progress: 1},
+	}
+	base := qbittorrent.Torrent{
+		State: "stoppedUP", Progress: 0.999, Size: 8, TotalSize: 9,
+		SavePath: "/downloads", ContentPath: "/downloads/bundle",
+	}
+	cases := []struct {
+		name    string
+		torrent qbittorrent.Torrent
+		files   []qbittorrent.File
+	}{
+		{"reported size below selected bytes", withTorrentSize(base, 4), files},
+		{"reported size above total bytes", withTorrentSize(base, 10), files},
+		{"missing corroborating total", func() qbittorrent.Torrent { t := base; t.TotalSize = 0; return t }(), files},
+		{"mismatched total", func() qbittorrent.Torrent { t := base; t.TotalSize = 8; return t }(), files},
+		{"remaining bytes", withAmountLeft(base, 1), files},
+		{"selected file incomplete", base, []qbittorrent.File{
+			{Index: 0, Name: "bundle/video.bin", Size: 5, Priority: 1, Progress: 0.99}, files[1],
+		}},
+		{"no skipped files but aggregate incomplete", withTorrentSize(base, 5), files[:1]},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := BuildManifest(tt.torrent, tt.files, source); !errors.Is(err, ErrIneligible) {
+				t.Fatalf("BuildManifest() error = %v, want ErrIneligible", err)
+			}
+		})
+	}
+}
+
 func TestBuildManifestSupportsSingleFileLayout(t *testing.T) {
 	localBase := t.TempDir()
 	writePayload(t, localBase, "movies/single file.mkv", []byte("data"))
