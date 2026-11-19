@@ -55,7 +55,7 @@ type Engine struct {
 	retentionExhaustedLogged bool
 }
 
-func NewEngine(db *sql.DB, client *qbittorrent.Client, source config.SourceConfig, destination config.DestinationConfig, log zerolog.Logger) (*Engine, error) {
+func NewEngine(db *sql.DB, client *qbittorrent.Client, source config.SourceConfig, destination config.DestinationConfig, log zerolog.Logger, settings ...config.ReplicationConfig) (*Engine, error) {
 	if db == nil {
 		return nil, errors.New("replication database is required")
 	}
@@ -67,7 +67,7 @@ func NewEngine(db *sql.DB, client *qbittorrent.Client, source config.SourceConfi
 		client:               client,
 		source:               source,
 		destination:          destination,
-		runner:               NewRunner(source, destination),
+		runner:               NewRunner(source, destination, settings...),
 		log:                  log,
 		wake:                 make(chan struct{}, 1),
 		catalog:              make(chan struct{}, 1),

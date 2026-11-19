@@ -33,6 +33,35 @@ func TestLoadDefaultsAndParsesDuration(t *testing.T) {
 	}
 }
 
+func TestReplicationTimeoutConfiguration(t *testing.T) {
+	base := "qbittorrent:\n  url: http://localhost:8080\n  username: user\n  password: pass\n"
+	cfg, err := Load(writeConfig(t, base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Replication.TransferTimeout != 2*time.Minute || cfg.Replication.VerificationTimeout != 30*time.Minute {
+		t.Fatalf("unexpected replication timeout defaults: %+v", cfg.Replication)
+	}
+	cfg, err = Load(writeConfig(t, base+"replication:\n  transfer_timeout: 5m\n  verification_timeout: 45m\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Replication.TransferTimeout != 5*time.Minute || cfg.Replication.VerificationTimeout != 45*time.Minute {
+		t.Fatalf("configured replication timeouts not applied: %+v", cfg.Replication)
+	}
+	for _, bad := range []string{
+		"  transfer_timeout: 0s\n",
+		"  transfer_timeout: -1s\n",
+		"  verification_timeout: 0s\n",
+		"  verification_timeout: 1ms\n",
+		"  verification_timeout: 1.5s\n",
+	} {
+		if _, err := Load(writeConfig(t, base+"replication:\n"+bad)); err == nil {
+			t.Errorf("accepted invalid timeout %q", bad)
+		}
+	}
+}
+
 func TestLoadStrictlyRejectsUnknownField(t *testing.T) {
 	path := writeConfig(t, `qbittorrent:
   url: http://localhost:8080

@@ -10,7 +10,31 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/anish-chanda/seedcache/internal/config"
 )
+
+func TestRsyncTimeoutArgs(t *testing.T) {
+	r := NewRunner(config.SourceConfig{}, config.DestinationConfig{}, config.ReplicationConfig{
+		TransferTimeout: 5 * time.Minute, VerificationTimeout: 45 * time.Minute,
+	})
+	for _, tc := range []struct {
+		verify bool
+		want   string
+	}{
+		{verify: false, want: "--timeout=300"},
+		{verify: true, want: "--timeout=2700"},
+	} {
+		for _, args := range [][]string{
+			r.rsyncArgs("nas", "/dst", "/src", tc.verify),
+			r.reverseRsyncArgs("nas", "/dst", "/src", tc.verify),
+		} {
+			if !strings.Contains(" "+strings.Join(args, " ")+" ", " "+tc.want+" ") {
+				t.Errorf("verify=%v: %q missing from args %v", tc.verify, tc.want, args)
+			}
+		}
+	}
+}
 
 func TestRsyncTransfersOnlyNULListedFilesAndVerifiesChecksums(t *testing.T) {
 	if _, err := exec.LookPath("rsync"); err != nil {

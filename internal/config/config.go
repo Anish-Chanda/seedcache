@@ -25,6 +25,7 @@ type Config struct {
 	Logging     LoggingConfig     `yaml:"logging"`
 	Source      SourceConfig      `yaml:"source"`
 	Destination DestinationConfig `yaml:"destination"`
+	Replication ReplicationConfig `yaml:"replication"`
 	Retention   RetentionConfig   `yaml:"retention"`
 }
 
@@ -45,6 +46,11 @@ type DestinationConfig struct {
 	SSHTarget    string            `yaml:"ssh_target"`
 	BasePath     string            `yaml:"base_path"`
 	PathMappings map[string]string `yaml:"path_mappings"`
+}
+
+type ReplicationConfig struct {
+	TransferTimeout     time.Duration `yaml:"transfer_timeout"`
+	VerificationTimeout time.Duration `yaml:"verification_timeout"`
 }
 
 func (c Config) ReplicationEnabled() bool {
@@ -79,11 +85,12 @@ func Load(path string) (Config, error) {
 	}
 
 	cfg := Config{
-		API:       APIConfig{Listen: "0.0.0.0:8765"},
-		Database:  DatabaseConfig{Path: "/var/lib/seedcache/seedcache.db"},
-		Discovery: DiscoveryConfig{Interval: 30 * time.Second},
-		Logging:   LoggingConfig{Level: "info"},
-		Retention: RetentionConfig{MinRatio: 1, MinSeedingTime: 72 * time.Hour, LowFreePercent: 10, TargetFreePercent: 20},
+		API:         APIConfig{Listen: "0.0.0.0:8765"},
+		Database:    DatabaseConfig{Path: "/var/lib/seedcache/seedcache.db"},
+		Discovery:   DiscoveryConfig{Interval: 30 * time.Second},
+		Logging:     LoggingConfig{Level: "info"},
+		Replication: ReplicationConfig{TransferTimeout: 2 * time.Minute, VerificationTimeout: 30 * time.Minute},
+		Retention:   RetentionConfig{MinRatio: 1, MinSeedingTime: 72 * time.Hour, LowFreePercent: 10, TargetFreePercent: 20},
 	}
 
 	data, err := os.ReadFile(path)
@@ -178,6 +185,10 @@ func validate(cfg Config) error {
 	}
 	if cfg.Discovery.Interval <= 0 {
 		return fmt.Errorf("discovery.interval must be greater than zero")
+	}
+	if cfg.Replication.TransferTimeout < time.Second || cfg.Replication.VerificationTimeout < time.Second ||
+		cfg.Replication.TransferTimeout%time.Second != 0 || cfg.Replication.VerificationTimeout%time.Second != 0 {
+		return fmt.Errorf("replication.transfer_timeout and replication.verification_timeout must be positive whole seconds")
 	}
 	if err := validateReplication(cfg); err != nil {
 		return err

@@ -42,7 +42,7 @@ func Run(ctx context.Context, path, version string) (result error) {
 	}
 	var engine *replication.Engine
 	if cfg.ReplicationEnabled() {
-		engine, err = replication.NewEngine(db, client, cfg.Source, cfg.Destination, log.With().Str("component", "replication").Logger())
+		engine, err = replication.NewEngine(db, client, cfg.Source, cfg.Destination, log.With().Str("component", "replication").Logger(), cfg.Replication)
 		if err != nil {
 			return fmt.Errorf("initialize replication: %w", err)
 		}

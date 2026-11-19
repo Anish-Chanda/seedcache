@@ -26,12 +26,24 @@ const (
 )
 
 type Runner struct {
-	source      config.SourceConfig
-	destination config.DestinationConfig
+	source              config.SourceConfig
+	destination         config.DestinationConfig
+	transferTimeout     time.Duration
+	verificationTimeout time.Duration
 }
 
-func NewRunner(source config.SourceConfig, destination config.DestinationConfig) *Runner {
-	return &Runner{source: source, destination: destination}
+// Defaults preserve the previous transfer timeout when callers omit settings.
+func NewRunner(source config.SourceConfig, destination config.DestinationConfig, settings ...config.ReplicationConfig) *Runner {
+	timeouts := config.ReplicationConfig{
+		TransferTimeout: 2 * time.Minute, VerificationTimeout: 30 * time.Minute,
+	}
+	if len(settings) != 0 {
+		timeouts = settings[0]
+	}
+	return &Runner{
+		source: source, destination: destination,
+		transferTimeout: timeouts.TransferTimeout, verificationTimeout: timeouts.VerificationTimeout,
+	}
 }
 
 func (r *Runner) transfer(ctx context.Context, manifest Manifest) error {
@@ -345,6 +357,14 @@ func formatVersion(version [3]int) string {
 	return fmt.Sprintf("%d.%d.%d", version[0], version[1], version[2])
 }
 
+func (r *Runner) rsyncTimeoutArg(verify bool) string {
+	timeout := r.transferTimeout
+	if verify {
+		timeout = r.verificationTimeout
+	}
+	return "--timeout=" + strconv.FormatInt(int64(timeout/time.Second), 10)
+}
+
 func (r *Runner) rsyncArgs(target, destinationRoot, sourceRoot string, verify bool) []string {
 	args := []string{
 		"--rsh=ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=15 -oServerAliveInterval=15 -oServerAliveCountMax=2",
@@ -358,7 +378,7 @@ func (r *Runner) rsyncArgs(target, destinationRoot, sourceRoot string, verify bo
 		"--relative",
 		"--mkpath",
 		"--partial-dir=" + partialDirectory,
-		"--timeout=120",
+		r.rsyncTimeoutArg(verify),
 	}
 	if verify {
 		args = append(args, "--checksum", "--dry-run", "--itemize-changes", "--out-format=%i")
@@ -382,7 +402,7 @@ func (r *Runner) reverseRsyncArgs(target, destinationRoot, sourceRoot string, ve
 		"--relative",
 		"--mkpath",
 		"--partial-dir=" + partialDirectory,
-		"--timeout=120",
+		r.rsyncTimeoutArg(verify),
 	}
 	if verify {
 		args = append(args, "--checksum", "--dry-run", "--itemize-changes", "--out-format=%i")
